@@ -1,11 +1,11 @@
-# Configuration file template (save as ~/.config/icloud-fuse/config.yaml)
+# Configuration file template (save as /etc/icloud/config.yaml)
 ---
 # iCloud credentials
 username: "your_apple_id@example.com"
 password: "your_apple_id_password"
 
 # Cache directory
-cache_dir: "~/.cache/icloud-fuse"
+cache_dir: "/tmp/icloud"
 
 # FUSE options
 fuse_options:
@@ -22,25 +22,25 @@ fuse_options:
 # pip install fuse-python pyicloud
 
 # 3. Create the configuration directory:
-# mkdir -p ~/.config/icloud-fuse
+# mkdir -p ~/.config/icloud-linux
 
 # 4. Copy this template to your config directory:
-# cp config.yaml ~/.config/icloud-fuse/
+# cp config.yaml ~/.config/icloud-linux/
 
 # 5. Edit the config file with your iCloud credentials:
-# nano ~/.config/icloud-fuse/config.yaml
+# nano ~/.config/icloud-linux/config.yaml
 
 # 6. Create the mount point:
 # mkdir -p ~/icloud
 
 # 7. Make the script executable:
-# chmod +x icloud-fuse.py
+# chmod +x driver.py
 
 # 8. Mount iCloud Drive:
-# ./icloud-fuse.py ~/icloud
+# ./driver.py ~/icloud
 
 # Note: To enable debug logging, use:
-# ./icloud-fuse.py -d ~/icloud
+# ./driver.py -d ~/icloud
 
 # Note: To run in foreground, use:
-# ./icloud-fuse.py -f ~/icloud
+# ./driver.py -f ~/icloud

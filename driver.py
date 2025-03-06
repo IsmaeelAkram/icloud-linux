@@ -48,7 +48,7 @@ class ICloudFS(fuse.Fuse):
         """Initialize the filesystem"""
         super(ICloudFS, self).__init__(*args, **kw)
 
-        self.logger = logging.getLogger("icloud-fuse")
+        self.logger = logging.getLogger("icloud")
         self.logger.info("Initializing iCloud FUSE filesystem")
 
         # These will be set in the main function after parsing config
@@ -613,7 +613,7 @@ def parse_config(config_path):
 def main():
     # Set up argument parser
     usage = """
-iCloud FUSE: Mount iCloud Drive as a filesystem
+iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     
 %prog [options] mountpoint
 """
@@ -628,8 +628,8 @@ iCloud FUSE: Mount iCloud Drive as a filesystem
         "-c",
         "--config",
         dest="config",
-        default=os.path.expanduser("~/.config/icloud-fuse/config.yaml"),
-        help="Path to config file (default: ~/.config/icloud-fuse/config.yaml)",
+        default=os.path.expanduser("/etc/icloud/config.yaml"),
+        help="Path to config file (default: /etc/icloud/config.yaml)",
     )
     fs.parser.add_option(
         "-v", "--debug", dest="debug", action="store_true", help="Enable debug logging"
@@ -642,9 +642,9 @@ iCloud FUSE: Mount iCloud Drive as a filesystem
     # Configure logging
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=log_level
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=log_level, handlers=[logging.StreamHandler(), logging.FileHandler("/var/log/icloud.log")]
     )
-    logger = logging.getLogger("icloud-fuse")
+    logger = logging.getLogger("icloud")
 
     # Parse configuration
     config = parse_config(args.config)
@@ -658,7 +658,7 @@ iCloud FUSE: Mount iCloud Drive as a filesystem
         sys.exit(1)
 
     # Set up cache directory
-    cache_dir = config.get("cache_dir", os.path.expanduser("~/.cache/icloud-fuse"))
+    cache_dir = config.get("cache_dir", os.path.expanduser("/tmp/icloud"))
 
     # Initialize iCloud connection
     fs.init_icloud(username, password, cache_dir)
