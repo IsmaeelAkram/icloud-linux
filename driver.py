@@ -128,8 +128,6 @@ class ICloudFS(fuse.Fuse):
             item = search_window[components[-1]]
             self.logger.debug("Successfully found and returning drive item")
             return item
-e
-            return None
         except Exception as e:
             self.logger.error(f"Error finding drive item at {path}: {str(e)}")
             return None
