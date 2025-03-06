@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=forking
-ExecStart=/usr/local/bin/icloud-fuse.py %h/icloud
+ExecStart=/usr/local/bin/icloud-fuse.py %h/iCloud
 Restart=on-failure
 RestartSec=30
 KillMode=process
