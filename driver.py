@@ -139,7 +139,7 @@ class ICloudFS(fuse.Fuse):
                         item_in_drive = self.api.drive[item]
                         # example in sample-item.py
                         self.logger.debug("get_drive_item: " + jsonpickle.encode(item_in_drive))
-                        return item_in_drive.data
+                        return item_in_drive
             return None
         except Exception as e:
             self.logger.error(f"Error finding drive item at {path}: {str(e)}")
@@ -148,12 +148,12 @@ class ICloudFS(fuse.Fuse):
     def _get_path_type(self, path):
         """Determine if a path is a file or directory"""
         item = self._get_drive_item(path)
-        self.logger.error("Getting path type from item obj: " + jsonpickle.encode(item))
+        # self.logger.debug("Getting path type from item obj: " + jsonpickle.encode(item))
         if item is None:
             return None
-        if 'type' in item:
-            self.logger.debug("Item type: " + item['type'])
-            return item['type']
+        if 'type' in item.data:
+            self.logger.debug("Item type: " + item.data['type'])
+            return item.data['type']
         # Default to folder if type attribute is missing
         defaulted_type = 'FOLDER' if hasattr(item, 'dir') else 'FILE'
         self.logger.debug("Defaulted type: " + defaulted_type)
@@ -208,8 +208,8 @@ class ICloudFS(fuse.Fuse):
             attrs.st_gid = os.getgid()
         else:
             self.logger.debug("Item is not a folder")
-            size = item['size'] if 'size' in item else 4096 
-            modified = item['dateModified'] if 'dateModified' in item else None
+            size = item.data['size'] if 'size' in item.data else 4096 
+            modified = item.data['dateModified'] if 'dateModified' in item.data else None
             if modified:
                 parsing = datetime.datetime.strptime(modified, "%Y-%m-%dT%H:%M:%SZ")
                 mtime = time.mktime(parsing.timetuple())
