@@ -140,13 +140,13 @@ class ICloudFS(fuse.Fuse):
 
     def getattr(self, path):
         """Get file attributes"""
-        # with self.cache_lock:
-        #     # Check cache first
-        #     if path in self.attr_cache:
-        #         attrs, timestamp = self.attr_cache[path]
-        #         if time.time() - timestamp < self.cache_timeout:
-        #             self.logger.debug("Attributes for path /" + str(path) + ": " + str(attrs))
-        #             return attrs
+        with self.cache_lock:
+            # Check cache first
+            if path in self.attr_cache:
+                attrs, timestamp = self.attr_cache[path]
+                if time.time() - timestamp < self.cache_timeout:
+                    self.logger.debug("Attributes for path /" + str(path) + ": " + str(attrs))
+                    return attrs
         
         self.logger.debug(f"getattr: {path}")
         now = time.time()
