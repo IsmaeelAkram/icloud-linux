@@ -98,25 +98,31 @@ class ICloudFS(fuse.Fuse):
         if path == '/' or path == '':
             return self.api.drive
             
-        print("Getting from path: " + str(path))
+        self.logger.debug("Getting from path: " + str(path))
         components = path.strip('/').split('/')
-        current = self.api.drive
+        self.logger.debug("Components: " + str(components))
         
         try:
+            # for component in components:
+            #     if not component:
+            #         continue
+            #     found = False
+            #     for item in current.dir():
+            #         self.logger.debug("Checking item: " + str(item) + " for " + component)
+            #         if str(item) == component:
+            #             current = item
+            #             found = True
+            #             break
+            #     if not found:
+            #         return None
+            # self.logger.debug("Found!: " + str(current))
+            # return current
             for component in components:
-                if not component:
-                    continue
-                found = False
-                for item in current.dir():
-                    self.logger.debug("Checking item: " + str(item) + " for " + component)
-                    if str(item) == component:
-                        current = item
-                        found = True
-                        break
-                if not found:
-                    return None
-            self.logger.debug("Found!")
-            return current
+                ls = self.api.drive.dir()
+                for item in ls:
+                    if item == component:
+                        return self.api.drive[item]
+            return None
         except Exception as e:
             self.logger.error(f"Error finding drive item at {path}: {str(e)}")
             return None
@@ -124,6 +130,7 @@ class ICloudFS(fuse.Fuse):
     def _get_path_type(self, path):
         """Determine if a path is a file or directory"""
         item = self._get_drive_item(path)
+        #self.logger.error("Getting path type from item obj: " + str(item))
         if item is None:
             return None
         if hasattr(item, 'type'):
@@ -133,12 +140,13 @@ class ICloudFS(fuse.Fuse):
 
     def getattr(self, path):
         """Get file attributes"""
-        with self.cache_lock:
-            # Check cache first
-            if path in self.attr_cache:
-                attrs, timestamp = self.attr_cache[path]
-                if time.time() - timestamp < self.cache_timeout:
-                    return attrs
+        # with self.cache_lock:
+        #     # Check cache first
+        #     if path in self.attr_cache:
+        #         attrs, timestamp = self.attr_cache[path]
+        #         if time.time() - timestamp < self.cache_timeout:
+        #             self.logger.debug("Attributes for path /" + str(path) + ": " + str(attrs))
+        #             return attrs
         
         self.logger.debug(f"getattr: {path}")
         now = time.time()
@@ -156,15 +164,18 @@ class ICloudFS(fuse.Fuse):
             }
             with self.cache_lock:
                 self.attr_cache[path] = (attrs, now)
+            self.logger.debug("Path was /")
             return attrs
             
         item = self._get_drive_item(path)
         if item is None:
+            self.logger.error("Item not found")
             return -errno.ENOENT
             
         item_type = self._get_path_type(path)
         
         if item_type == 'folder':
+            self.logger.debug("Item is folder")
             attrs = {
                 'st_mode': stat.S_IFDIR | 0o755,
                 'st_nlink': 2,
@@ -176,6 +187,7 @@ class ICloudFS(fuse.Fuse):
                 'st_gid': os.getgid()
             }
         else:
+            self.logger.debug("Item is not a folder")
             size = getattr(item, 'size', 0)
             modified = getattr(item, 'date_modified', None)
             mtime = time.mktime(modified.timetuple()) if modified else now
@@ -193,7 +205,8 @@ class ICloudFS(fuse.Fuse):
             
         with self.cache_lock:
             self.attr_cache[path] = (attrs, now)
-            
+        
+        self.logger.debug("Final attributes: " + str(attrs))
         return attrs
 
     def readdir(self, path, offset):
