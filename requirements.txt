@@ -1,0 +1,3 @@
+fuse-python
+pyyaml
+pyicloud

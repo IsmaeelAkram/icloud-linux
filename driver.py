@@ -24,6 +24,19 @@ if not hasattr(fuse, '__version__'):
 # Ensure all operations are defined
 fuse.fuse_python_api = (0, 2)
 
+class Stat(fuse.Stat):
+    def __init__(self):
+        self.st_mode = 0
+        self.st_ino = 0
+        self.st_dev = 0
+        self.st_nlink = 0
+        self.st_uid = 0
+        self.st_gid = 0
+        self.st_size = 0
+        self.st_atime = 0
+        self.st_mtime = 0
+        self.st_ctime = 0
+
 class ICloudFS(fuse.Fuse):
     """
     A FUSE driver for mounting iCloud as a filesystem using Fuse2 with fuse-python.
@@ -124,7 +137,8 @@ class ICloudFS(fuse.Fuse):
                 for item in ls:
                     if item == component:
                         item_in_drive = self.api.drive[item]
-                        # sample-item.py <- self.logger.debug("get_drive_item: " + jsonpickle.encode(item_in_drive))
+                        # example in sample-item.py
+                        self.logger.debug("get_drive_item: " + jsonpickle.encode(item_in_drive))
                         return item_in_drive.data
             return None
         except Exception as e:
@@ -158,17 +172,18 @@ class ICloudFS(fuse.Fuse):
         self.logger.debug(f"getattr: {path}")
         now = int(time.time())
         
+        attrs = Stat()
+
         if path == '/':
-            attrs = {
-                'st_mode': stat.S_IFDIR | 0o755,
-                'st_nlink': 2,
-                'st_size': 4096,
-                'st_ctime': now,
-                'st_mtime': now,
-                'st_atime': now,
-                'st_uid': os.getuid(),
-                'st_gid': os.getgid()
-            }
+            attrs.st_mode = stat.S_IFDIR | 0o755
+            attrs.st_nlink = 2
+            attrs.st_size = 0
+            attrs.st_ctime = now
+            attrs.st_mtime = now
+            attrs.st_atime = now
+            attrs.st_uid = os.getuid()
+            attrs.st_gid = os.getgid()
+
             with self.cache_lock:
                 self.attr_cache[path] = (attrs, now)
             self.logger.debug("Path was /")
@@ -183,16 +198,14 @@ class ICloudFS(fuse.Fuse):
         
         if item_type == 'FOLDER':
             self.logger.debug("Item is folder")
-            attrs = {
-                'st_mode': stat.S_IFDIR | 0o755,
-                'st_nlink': 3,
-                'st_size': 4096,
-                'st_ctime': now,
-                'st_mtime': now,
-                'st_atime': now,
-                'st_uid': os.getuid(),
-                'st_gid': os.getgid()
-            }
+            attrs.st_mode = stat.S_IFDIR | 0o755
+            attrs.st_nlink = 3
+            attrs.st_size = 0
+            attrs.st_ctime = now
+            attrs.st_mtime = now
+            attrs.st_atime = now
+            attrs.st_uid = os.getuid()
+            attrs.st_gid = os.getgid()
         else:
             self.logger.debug("Item is not a folder")
             size = item['size'] if 'size' in item else 4096 
@@ -202,19 +215,16 @@ class ICloudFS(fuse.Fuse):
                 mtime = time.mktime(parsing.timetuple())
             else:
                 mtime = now
-
             mtime = int(mtime)
             
-            attrs = {
-                'st_mode': stat.S_IFREG | 0o644,
-                'st_nlink': 1,
-                'st_size': size,
-                'st_ctime': mtime,
-                'st_mtime': mtime,
-                'st_atime': now,
-                'st_uid': os.getuid(),
-                'st_gid': os.getgid()
-            }
+            attrs.st_mode = stat.S_IFREG | 0o644
+            attrs.st_nlink = 1
+            attrs.st_size = size
+            attrs.st_ctime = mtime
+            attrs.st_mtime = mtime
+            attrs.st_atime = now
+            attrs.st_uid = os.getuid()
+            attrs.st_gid = os.getgid()
             
         with self.cache_lock:
             self.attr_cache[path] = (attrs, now)
@@ -230,19 +240,24 @@ class ICloudFS(fuse.Fuse):
         with self.cache_lock:
             # Check cache first
             if path in self.dir_cache:
+                self.logger.debug("readdir: in cache")
                 entries_stored, timestamp = self.dir_cache[path]
                 if time.time() - timestamp < self.cache_timeout:
                     entries = entries_stored
         
         if len(entries) <= 2:  # Not in cache or cache has just . and ..
+            self.logger.debug("readdir: not in cache")
             try:
                 item = self._get_drive_item(path)
                 if item is None:
                     return -errno.ENOENT
-                    
-                # List directory contents
-                for child in item.dir():
-                    entries.append(child.name)
+                   
+                if hasattr(item, 'dir'):
+                    # List directory contents
+                    for child in item.dir():
+                        entries.append(child)
+                else:
+                    return -errno.ENOTDIR
                     
                 with self.cache_lock:
                     self.dir_cache[path] = (entries, time.time())
