@@ -98,6 +98,7 @@ class ICloudFS(fuse.Fuse):
         if path == '/' or path == '':
             return self.api.drive
             
+        print("Getting from path: " + str(path))
         components = path.strip('/').split('/')
         current = self.api.drive
         
@@ -107,12 +108,14 @@ class ICloudFS(fuse.Fuse):
                     continue
                 found = False
                 for item in current.dir():
-                    if item.name == component:
+                    self.logger.debug("Checking item: " + str(item) + " for " + component)
+                    if str(item) == component:
                         current = item
                         found = True
                         break
                 if not found:
                     return None
+            self.logger.debug("Found!")
             return current
         except Exception as e:
             self.logger.error(f"Error finding drive item at {path}: {str(e)}")
@@ -356,7 +359,8 @@ class ICloudFS(fuse.Fuse):
                     
             return 0
         except Exception as e:
-            self.logger.error(f"Error creating directory {path}: {str(e)}")
+            raise e
+            self.logger.error(f"Error creating directory {path}: {str(type(e))} {str(e)}")
             return -errno.EIO
 
     def rmdir(self, path):
