@@ -113,7 +113,7 @@ class ICloudFS(fuse.Fuse):
         if path == '/' or path == '':
             return self.api.drive
             
-        self.logger.debug("Getting from path: " + str(path))
+        self.logger.debug("Getting drive item from path: " + str(path))
         components = path.strip('/').split('/')
         self.logger.debug("Components: " + str(components))
         
@@ -138,7 +138,8 @@ class ICloudFS(fuse.Fuse):
                     if item == component:
                         item_in_drive = self.api.drive[item]
                         # example in sample-item.py
-                        self.logger.debug("get_drive_item: " + jsonpickle.encode(item_in_drive))
+                        #self.logger.debug("get_drive_item: " + jsonpickle.encode(item_in_drive))
+                        self.logger.debug("Successfully found and returning drive item")
                         return item_in_drive
             return None
         except Exception as e:
@@ -275,10 +276,12 @@ class ICloudFS(fuse.Fuse):
         
         item = self._get_drive_item(path)
         if item is None:
+            self.logger.error("open: Item is none")
             return -errno.ENOENT
             
         fd = self._get_next_fd()
         self.fd_map[fd] = path
+        self.logger.debug("open: Returning file descriptor: " + str(fd))
         return fd
 
     def read(self, path, size, offset):
@@ -361,8 +364,8 @@ class ICloudFS(fuse.Fuse):
                     if parent is None:
                         return -errno.ENOENT
                     
-                    # Upload the file to iCloud
-                    parent.upload(filename, BytesIO(content))
+                    # TODO: Upload the file to iCloud. BytesIO object has no attribute 'name'
+                    # parent.upload(BytesIO(content))
                     
                     # Invalidate caches for this path
                     if path in self.attr_cache:
