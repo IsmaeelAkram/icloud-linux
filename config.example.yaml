@@ -12,35 +12,3 @@ fuse_options:
   allow_other: false  # Set to true to allow other users to access the mount
   ro: false           # Set to true for read-only access
   nonempty: true      # Allow mounting over a non-empty directory
-
-# Installation Instructions for Arch Linux with Fuse2
-
-# 1. Install required packages from official repositories:
-# sudo pacman -S fuse2 python-yaml
-
-# 2. Install fuse-python and pyicloud using pip:
-# pip install fuse-python pyicloud
-
-# 3. Create the configuration directory:
-# mkdir -p ~/.config/icloud-linux
-
-# 4. Copy this template to your config directory:
-# cp config.yaml ~/.config/icloud-linux/
-
-# 5. Edit the config file with your iCloud credentials:
-# nano ~/.config/icloud-linux/config.yaml
-
-# 6. Create the mount point:
-# mkdir -p ~/icloud
-
-# 7. Make the script executable:
-# chmod +x driver.py
-
-# 8. Mount iCloud Drive:
-# ./driver.py ~/icloud
-
-# Note: To enable debug logging, use:
-# ./driver.py -d ~/icloud
-
-# Note: To run in foreground, use:
-# ./driver.py -f ~/icloud
