@@ -23,7 +23,7 @@ This project provides a FUSE-based driver to mount iCloud Drive as a filesystem 
 1. **Install Dependencies**:
    - Install FUSE2 and Python dependencies:
      ```bash
-     sudo apt install fuse
+     sudo apt install fuse # or `fuse2`
      pip install -r requirements.txt
      ```
 
