@@ -47,7 +47,7 @@ This project provides a FUSE-based driver to mount iCloud Drive as a filesystem 
      ```
 
 4. **Start the Service**:
-   - The installation process will prompt you to specify a mount point (default: `~/iCloud`). The service will be enabled and started automatically:
+   - The installation process will prompt you to specify a mount point (recommended: `/home/<user>/iCloud`). The service will be enabled and started automatically:
      ```bash
      systemctl enable --now icloud
      ```
