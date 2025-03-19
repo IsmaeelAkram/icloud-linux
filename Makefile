@@ -1,7 +1,5 @@
 install:
 	sudo cp ./driver.py /usr/local/bin/icloud
-	mkdir -p /etc/icloud
-	cp config.example.yaml /etc/icloud/config.yaml
 	cp icloud.service /etc/systemd/system/icloud.service
 	echo "Where would you like to mount iCloud? (default: /home/user/iCloud)"
 	read -p "Mount point: " MOUNT_POINT; \
