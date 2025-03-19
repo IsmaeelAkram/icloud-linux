@@ -121,14 +121,10 @@ To uninstall the driver and remove all related files:
 ## Troubleshooting
 
 - **Debug Logging**:
-  - Enable debug logging by running the driver with the `-v` option:
+  - Enable debug logging by running the driver with the `-f` (foreground), `-v` (verbose), and `-d` (FUSE debug) options:
     ```bash
-    ./driver.py -v ~/iCloud
+    ./driver.py -fvd ~/iCloud
     ```
-  - Enable further FUSE debugging by adding `-d` to the command:
-    ```bash
-    ./driver.py -vd ~/iCloud
-    ``` 
 
 - **Log File**:
   - Check the log file at `/var/log/icloud.log` for detailed error messages.
