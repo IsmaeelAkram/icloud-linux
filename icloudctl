@@ -34,7 +34,8 @@ create_config_if_missing() {
 }
 
 write_service() {
-  cat > "$SERVICE_FILE" <<'EOF'
+  local mount_dir="$1"
+  cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=iCloud Linux FUSE filesystem (user)
 After=network-online.target
@@ -42,8 +43,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=%h/.config/icloud-linux/icloud.env
-ExecStart=%h/icloud-linux/.venv/bin/python %h/icloud-linux/driver.py -f -c ${ICLOUD_CONFIG} ${ICLOUD_MOUNT}
+ExecStart=$REPO_DIR/.venv/bin/python $REPO_DIR/driver.py -f -c $CONFIG_FILE $mount_dir
 Restart=on-failure
 RestartSec=15
 KillMode=process
@@ -70,8 +70,24 @@ cmd_init() {
   ensure_dirs
   ensure_venv
   create_config_if_missing
+
+  mkdir -p "$mount_dir"
+  if [[ ! -w "$mount_dir" ]]; then
+    local fallback="$HOME/iCloudDrive"
+    mkdir -p "$fallback"
+    if [[ -w "$fallback" ]]; then
+      echo "Mount dir not writable: $mount_dir"
+      echo "Using fallback mount dir: $fallback"
+      mount_dir="$fallback"
+    else
+      echo "Mount dir is not writable: $mount_dir"
+      echo "Fix with: sudo chown -R $USER:$USER '$mount_dir'"
+      exit 1
+    fi
+  fi
+
   write_env "$mount_dir"
-  write_service
+  write_service "$mount_dir"
   systemctl --user daemon-reload
   systemctl --user enable icloud.service >/dev/null
   echo "Initialized."
@@ -123,7 +139,16 @@ cmd_doctor() {
   done
   [[ -x "$REPO_DIR/.venv/bin/python" ]] && echo "OK: virtualenv" || echo "MISSING: virtualenv"
   [[ -f "$CONFIG_FILE" ]] && echo "OK: config" || echo "MISSING: $CONFIG_FILE"
-  [[ -f "$ENV_FILE" ]] && echo "OK: env" || echo "MISSING: $ENV_FILE"
+  if [[ -f "$ENV_FILE" ]]; then
+    echo "OK: env"
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    if [[ -n "${ICLOUD_MOUNT:-}" ]]; then
+      [[ -w "$ICLOUD_MOUNT" ]] && echo "OK: mount writable ($ICLOUD_MOUNT)" || echo "WARN: mount not writable ($ICLOUD_MOUNT)"
+    fi
+  else
+    echo "MISSING: $ENV_FILE"
+  fi
   systemctl --user --no-pager status icloud.service >/dev/null 2>&1 && echo "OK: service exists" || echo "WARN: service not initialized"
 }
 
