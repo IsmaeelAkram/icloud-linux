@@ -1,4 +1,4 @@
-.PHONY: help quickstart init configure auth start stop restart status logs doctor
+.PHONY: help quickstart init configure auth start stop restart status logs doctor uninstall
 
 help:
 	@echo "Targets:"
@@ -6,7 +6,7 @@ help:
 	@echo "  make init         # init venv/config/service"
 	@echo "  make configure    # write credentials config"
 	@echo "  make auth         # run interactive 2FA bootstrap"
-	@echo "  make start|stop|restart|status|logs|doctor"
+	@echo "  make start|stop|restart|status|logs|doctor|uninstall"
 
 quickstart:
 	./icloudctl quickstart
@@ -37,3 +37,6 @@ logs:
 
 doctor:
 	./icloudctl doctor
+
+uninstall:
+	./icloudctl uninstall

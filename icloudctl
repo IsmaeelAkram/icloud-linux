@@ -132,6 +132,24 @@ cmd_restart() { systemctl --user restart icloud.service; systemctl --user --no-p
 cmd_status() { systemctl --user --no-pager status icloud.service; }
 cmd_logs() { journalctl --user -u icloud.service -f; }
 
+cmd_uninstall() {
+  local purge="${1:-}"
+  systemctl --user stop icloud.service >/dev/null 2>&1 || true
+  systemctl --user disable icloud.service >/dev/null 2>&1 || true
+  rm -f "$SERVICE_FILE"
+  systemctl --user daemon-reload
+  systemctl --user reset-failed >/dev/null 2>&1 || true
+
+  if [[ "$purge" == "--purge" ]]; then
+    rm -f "$CONFIG_FILE" "$ENV_FILE"
+    rm -rf "$CONFIG_DIR/cookies" "$CACHE_DIR" "$STATE_DIR"
+    echo "Uninstalled and purged local config/cache/session data."
+  else
+    echo "Uninstalled service. Config/cookies/cache kept."
+    echo "Use './icloudctl uninstall --purge' to remove local data too."
+  fi
+}
+
 cmd_doctor() {
   echo "== icloud-linux doctor =="
   for c in python3 systemctl fusermount; do
@@ -179,6 +197,7 @@ Commands:
   status                   Show service status
   logs                     Tail service logs
   doctor                   Check local setup health
+  uninstall [--purge]      Remove service (optionally remove local data)
 EOF
 }
 
@@ -196,6 +215,7 @@ main() {
     status) cmd_status ;;
     logs) cmd_logs ;;
     doctor) cmd_doctor ;;
+    uninstall) cmd_uninstall "$@" ;;
     ""|-h|--help|help) usage ;;
     *) echo "Unknown command: $cmd"; usage; exit 1 ;;
   esac

@@ -37,6 +37,7 @@ If cookies expire, just run `./icloudctl auth` again.
 ./icloudctl status
 ./icloudctl logs
 ./icloudctl doctor
+./icloudctl uninstall [--purge]
 ```
 
 ## Files and paths
