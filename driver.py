@@ -1,4 +1,4 @@
-#!/home/ismaeel/venv/bin/python3
+#!/usr/bin/env python3
 
 import os
 import datetime
@@ -76,29 +76,57 @@ class ICloudFS(fuse.Fuse):
         self.fd_lock = threading.Lock()
         self.fd_map = {}  # Maps file descriptors to file paths
 
-    def init_icloud(self, username, password, cache_dir):
+    def init_icloud(self, username, password, cache_dir, cookie_dir=None):
         """Initialize iCloud connection"""
         self.username = username
         self.password = password
         self.cache_dir = cache_dir
 
         os.makedirs(self.cache_dir, exist_ok=True)
+        if cookie_dir:
+            os.makedirs(cookie_dir, exist_ok=True)
 
         try:
-            self.api = PyiCloudService(username, password)
-            if self.api.requires_2fa:
-                print("Two-factor authentication required.")
-                code = input("Enter the verification code: ")
-                result = self.api.validate_2fa_code(code)
-                print("Result: %s" % result)
+            self.api = PyiCloudService(username, password, cookie_directory=cookie_dir)
 
-                if not result:
-                    print("Failed to verify 2FA code")
-                    sys.exit(1)
-
+            # Never block a systemd service waiting for stdin.
             if self.api.requires_2fa:
-                print("Two-factor authentication still required. Exiting.")
-                sys.exit(1)
+                if sys.stdin.isatty():
+                    print("Two-factor authentication required.")
+                    code = input("Enter the verification code: ").strip()
+                    result = self.api.validate_2fa_code(code)
+                    print("Result: %s" % result)
+                    if result:
+                        if not self.api.is_trusted_session:
+                            self.api.trust_session()
+                else:
+                    raise RuntimeError(
+                        "2FA required, but no interactive terminal is available. "
+                        "Run './icloudctl auth' first to establish a trusted session."
+                    )
+
+            if self.api.requires_2sa:
+                if sys.stdin.isatty():
+                    print("Two-step authentication required.")
+                    devices = self.api.trusted_devices
+                    for i, device in enumerate(devices):
+                        label = device.get('deviceName') or f"SMS to {device.get('phoneNumber', 'unknown')}"
+                        print(f"{i}: {label}")
+                    idx = int(input("Select device index: ").strip() or "0")
+                    device = devices[idx]
+                    self.api.send_verification_code(device)
+                    code = input("Enter the verification code: ").strip()
+                    if not self.api.validate_verification_code(device, code):
+                        raise RuntimeError("Failed to verify 2SA code")
+                else:
+                    raise RuntimeError(
+                        "2SA required, but no interactive terminal is available. "
+                        "Run './icloudctl auth' first to establish a trusted session."
+                    )
+
+            if self.api.requires_2fa or self.api.requires_2sa:
+                raise RuntimeError("Additional authentication still required after code verification.")
+
         except Exception as e:
             self.logger.error(f"Failed to connect to iCloud: {str(e)}")
             raise
@@ -628,8 +656,8 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         "-c",
         "--config",
         dest="config",
-        default=os.path.expanduser("/etc/icloud/config.yaml"),
-        help="Path to config file (default: /etc/icloud/config.yaml)",
+        default=os.path.expanduser("~/.config/icloud-linux/config.yaml"),
+        help="Path to config file (default: ~/.config/icloud-linux/config.yaml)",
     )
     fs.parser.add_option(
         "-v", "--debug", dest="debug", action="store_true", help="Enable debug logging"
@@ -641,8 +669,13 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
 
     # Configure logging
     log_level = logging.DEBUG if args.debug else logging.INFO
+    log_path = os.environ.get("ICLOUD_LOG_PATH", os.path.expanduser("~/.local/state/icloud-linux/icloud.log"))
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
     logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=log_level, handlers=[logging.StreamHandler(), logging.FileHandler("/var/log/icloud.log")]
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=log_level,
+        handlers=[logging.StreamHandler(), logging.FileHandler(log_path)],
     )
     logger = logging.getLogger("icloud")
 
@@ -657,11 +690,12 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         logger.error("Username or password not provided in config file")
         sys.exit(1)
 
-    # Set up cache directory
-    cache_dir = config.get("cache_dir", os.path.expanduser("/tmp/icloud"))
+    # Set up cache and cookie directories
+    cache_dir = config.get("cache_dir", os.path.expanduser("~/.cache/icloud-linux"))
+    cookie_dir = config.get("cookie_dir", os.path.expanduser("~/.config/icloud-linux/cookies"))
 
     # Initialize iCloud connection
-    fs.init_icloud(username, password, cache_dir)
+    fs.init_icloud(username, password, cache_dir, cookie_dir)
 
     # Start FUSE
     fs.main()

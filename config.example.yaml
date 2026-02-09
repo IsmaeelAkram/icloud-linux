@@ -1,11 +1,15 @@
-# Configuration file template (save as /etc/icloud/config.yaml)
+# Configuration file template (save as ~/.config/icloud-linux/config.yaml)
 ---
 # iCloud credentials
+# NOTE: pyicloud requires your Apple ID account password (not app-specific password)
 username: "your_apple_id@example.com"
 password: "your_apple_id_password"
 
 # Cache directory
-cache_dir: "/tmp/icloud"
+cache_dir: "~/.cache/icloud-linux"
+
+# Persistent cookie/session directory used after one-time 2FA bootstrap
+cookie_dir: "~/.config/icloud-linux/cookies"
 
 # FUSE options
 fuse_options:

@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="$HOME/.config/icloud-linux"
+STATE_DIR="$HOME/.local/state/icloud-linux"
+CACHE_DIR="$HOME/.cache/icloud-linux"
+SERVICE_DIR="$HOME/.config/systemd/user"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+ENV_FILE="$CONFIG_DIR/icloud.env"
+SERVICE_FILE="$SERVICE_DIR/icloud.service"
+MOUNT_DIR_DEFAULT="$HOME/iCloud"
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1"; exit 1; }; }
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR" "$SERVICE_DIR"
+}
+
+ensure_venv() {
+  if [[ ! -x "$REPO_DIR/.venv/bin/python" ]]; then
+    echo "Creating virtualenv..."
+    python3 -m venv "$REPO_DIR/.venv"
+  fi
+  "$REPO_DIR/.venv/bin/pip" install -q -r "$REPO_DIR/requirements.txt"
+}
+
+create_config_if_missing() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cp "$REPO_DIR/config.example.yaml" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    echo "Created $CONFIG_FILE"
+  fi
+}
+
+write_service() {
+  cat > "$SERVICE_FILE" <<'EOF'
+[Unit]
+Description=iCloud Linux FUSE filesystem (user)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/icloud-linux/icloud.env
+ExecStart=%h/icloud-linux/.venv/bin/python %h/icloud-linux/driver.py -f -c ${ICLOUD_CONFIG} ${ICLOUD_MOUNT}
+Restart=on-failure
+RestartSec=15
+KillMode=process
+Environment=ICLOUD_LOG_PATH=%h/.local/state/icloud-linux/icloud.log
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+write_env() {
+  local mount_dir="${1:-$MOUNT_DIR_DEFAULT}"
+  mkdir -p "$mount_dir"
+  cat > "$ENV_FILE" <<EOF
+ICLOUD_CONFIG=$CONFIG_FILE
+ICLOUD_MOUNT=$mount_dir
+EOF
+  chmod 600 "$ENV_FILE"
+}
+
+cmd_init() {
+  local mount_dir="${1:-$MOUNT_DIR_DEFAULT}"
+  need_cmd systemctl
+  ensure_dirs
+  ensure_venv
+  create_config_if_missing
+  write_env "$mount_dir"
+  write_service
+  systemctl --user daemon-reload
+  systemctl --user enable icloud.service >/dev/null
+  echo "Initialized."
+  echo "- Config: $CONFIG_FILE"
+  echo "- Env:    $ENV_FILE"
+  echo "- Mount:  $mount_dir"
+  echo "Next: ./icloudctl auth"
+}
+
+cmd_configure() {
+  ensure_dirs
+  create_config_if_missing
+  local email="${1:-}"
+  if [[ -z "$email" ]]; then
+    read -r -p "Apple ID email: " email
+  fi
+  read -r -s -p "Apple ID password (input hidden): " password
+  echo
+  cat > "$CONFIG_FILE" <<EOF
+username: "$email"
+password: "$password"
+cache_dir: "$CACHE_DIR"
+cookie_dir: "$CONFIG_DIR/cookies"
+fuse_options:
+  allow_other: false
+  ro: false
+  nonempty: true
+EOF
+  chmod 600 "$CONFIG_FILE"
+  echo "Wrote $CONFIG_FILE"
+}
+
+cmd_auth() {
+  ensure_venv
+  create_config_if_missing
+  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/auth.py" "$CONFIG_FILE"
+}
+
+cmd_start() { systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
+cmd_stop() { systemctl --user stop icloud.service; }
+cmd_restart() { systemctl --user restart icloud.service; systemctl --user --no-pager status icloud.service; }
+cmd_status() { systemctl --user --no-pager status icloud.service; }
+cmd_logs() { journalctl --user -u icloud.service -f; }
+
+cmd_doctor() {
+  echo "== icloud-linux doctor =="
+  for c in python3 systemctl fusermount; do
+    if command -v "$c" >/dev/null 2>&1; then echo "OK: $c"; else echo "MISSING: $c"; fi
+  done
+  [[ -x "$REPO_DIR/.venv/bin/python" ]] && echo "OK: virtualenv" || echo "MISSING: virtualenv"
+  [[ -f "$CONFIG_FILE" ]] && echo "OK: config" || echo "MISSING: $CONFIG_FILE"
+  [[ -f "$ENV_FILE" ]] && echo "OK: env" || echo "MISSING: $ENV_FILE"
+  systemctl --user --no-pager status icloud.service >/dev/null 2>&1 && echo "OK: service exists" || echo "WARN: service not initialized"
+}
+
+cmd_quickstart() {
+  local mount_dir="${1:-$MOUNT_DIR_DEFAULT}"
+  cmd_init "$mount_dir"
+  echo
+  echo "Now configure credentials:"
+  cmd_configure
+  echo
+  echo "Authenticate (2FA):"
+  cmd_auth
+  echo
+  echo "Starting service..."
+  cmd_start
+}
+
+usage() {
+  cat <<EOF
+Usage: ./icloudctl <command> [args]
+
+Commands:
+  quickstart [mount_dir]   One-command guided setup
+  init [mount_dir]         Initialize venv/config/service files
+  configure [email]        Write config.yaml with credentials
+  auth                     Run interactive 2FA bootstrap
+  start|stop|restart       Service control
+  status                   Show service status
+  logs                     Tail service logs
+  doctor                   Check local setup health
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    quickstart) cmd_quickstart "$@" ;;
+    init) cmd_init "$@" ;;
+    configure) cmd_configure "$@" ;;
+    auth) cmd_auth ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    status) cmd_status ;;
+    logs) cmd_logs ;;
+    doctor) cmd_doctor ;;
+    ""|-h|--help|help) usage ;;
+    *) echo "Unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,15 @@
+[Unit]
+Description=iCloud Linux FUSE filesystem (user)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/icloud-linux/.venv/bin/python %h/icloud-linux/driver.py -f -c %h/.config/icloud-linux/config.yaml %h/iCloud
+Restart=on-failure
+RestartSec=15
+KillMode=process
+Environment=ICLOUD_LOG_PATH=%h/.local/state/icloud-linux/icloud.log
+
+[Install]
+WantedBy=default.target

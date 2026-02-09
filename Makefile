@@ -1,21 +1,39 @@
-install:
-	sudo cp ./driver.py /usr/local/bin/icloud
-	cp icloud.service /etc/systemd/system/icloud.service
-	echo "Where would you like to mount iCloud? (recommended: /home/<user>/iCloud)"
-	read -p "Mount point: " MOUNT_POINT; \
-	if [ -z "$$MOUNT_POINT" ]; then \
-		MOUNT_POINT="~/iCloud"; \
-	fi; \
-	mkdir -p $$MOUNT_POINT
-	systemctl enable --now icloud
-	echo "iCloud Linux installed successfully. Mounted at $$MOUNT_POINT."
+.PHONY: help quickstart init configure auth start stop restart status logs doctor
 
-uninstall:
-	systemctl stop icloud
-	systemctl disable icloud
-	rm /etc/systemd/system/icloud.service
-	rm /usr/local/bin/icloud
-	rm -rf /etc/icloud
-	rm -rf /tmp/icloud
-	
-	@echo "iCloud Linux uninstalled successfully."
+help:
+	@echo "Targets:"
+	@echo "  make quickstart   # guided setup"
+	@echo "  make init         # init venv/config/service"
+	@echo "  make configure    # write credentials config"
+	@echo "  make auth         # run interactive 2FA bootstrap"
+	@echo "  make start|stop|restart|status|logs|doctor"
+
+quickstart:
+	./icloudctl quickstart
+
+init:
+	./icloudctl init
+
+configure:
+	./icloudctl configure
+
+auth:
+	./icloudctl auth
+
+start:
+	./icloudctl start
+
+stop:
+	./icloudctl stop
+
+restart:
+	./icloudctl restart
+
+status:
+	./icloudctl status
+
+logs:
+	./icloudctl logs
+
+doctor:
+	./icloudctl doctor

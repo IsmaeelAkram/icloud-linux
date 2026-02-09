@@ -1,137 +1,82 @@
-# iCloud Linux FUSE Filesystem
+# icloud-linux
 
-This project provides a FUSE-based driver to mount iCloud Drive as a filesystem on Linux. It allows users to interact with their iCloud Drive files and directories as if they were part of the local filesystem.
+Mount iCloud Drive on Linux using FUSE.
 
-## Features
+## TL;DR (fast setup)
 
-- Mount iCloud Drive as a FUSE filesystem.
-- Read and write files directly to iCloud Drive.
-- Cache file and directory metadata for improved performance.
-- Support for basic filesystem operations such as reading, writing, renaming, and deleting files and directories.
+```bash
+git clone https://github.com/ismaeelakram/icloud-linux.git
+cd icloud-linux
+./icloudctl quickstart ~/iCloud
+```
 
-## Requirements
+`quickstart` will:
+1. create a virtualenv and install Python deps
+2. initialize user config/service files
+3. prompt for Apple ID credentials
+4. run one-time interactive 2FA auth
+5. start the user service
 
-- Python 3
-- `fuse-python` library
-- `pyicloud` library
-- `pyyaml` library
-- `jsonpickle` library
-- FUSE2 (Filesystem in Userspace)
+## Why this works with 2FA
 
-## Installation
+Systemd services are non-interactive, so they cannot wait for 2FA input.
 
-1. **Install Dependencies**:
-   - Install FUSE2 and Python dependencies:
-     ```bash
-     sudo apt install fuse # or `fuse2`
-     pip install -r requirements.txt
-     ```
+This project uses a **two-phase auth flow**:
+- `./icloudctl auth` (interactive, one-time) stores trusted session cookies
+- `icloud.service` (background) reuses saved cookies and runs non-interactively
 
-2. **Set Up Configuration**:
-   - Copy the example configuration file to `/etc/icloud/config.yaml`:
-     ```bash
-     sudo mkdir -p /etc/icloud
-     sudo cp config.example.yaml /etc/icloud/config.yaml
-     ```
-   - Edit the configuration file to include your iCloud credentials:
-     ```yaml
-     username: "your_apple_id@example.com"
-     password: "your_apple_id_password"
-     cache_dir: "/tmp/icloud"
-     ```
+If cookies expire, just run `./icloudctl auth` again.
 
-3. **Install the Driver**:
-   - Run the `Makefile` to install the driver and systemd service:
-     ```bash
-     make install
-     ```
+## Commands
 
-4. **Start the Service**:
-   - The installation process will prompt you to specify a mount point (recommended: `/home/<user>/iCloud`). The service will be enabled and started automatically:
-     ```bash
-     systemctl enable --now icloud
-     ```
+```bash
+./icloudctl init [mount_dir]      # prepare venv/config/service
+./icloudctl configure [email]      # write config.yaml interactively
+./icloudctl auth                   # one-time 2FA bootstrap
+./icloudctl start|stop|restart
+./icloudctl status
+./icloudctl logs
+./icloudctl doctor
+```
 
-5. **Verify the Mount**:
-   - Check if the iCloud Drive is mounted at the specified location:
-     ```bash
-     ls ~/iCloud
-     ```
+## Files and paths
 
-## How It Works
+- Config: `~/.config/icloud-linux/config.yaml`
+- Service env: `~/.config/icloud-linux/icloud.env`
+- Session cookies: `~/.config/icloud-linux/cookies`
+- Cache: `~/.cache/icloud-linux`
+- Logs: `~/.local/state/icloud-linux/icloud.log`
+- Systemd user service: `~/.config/systemd/user/icloud.service`
 
-### Overview
+## Debian/Ubuntu prerequisites
 
-The driver uses the `pyicloud` library to interact with iCloud Drive and the `fuse-python` library to implement a FUSE-based filesystem. It provides a seamless interface for accessing iCloud Drive files and directories on Linux.
+You need FUSE + Python tooling installed once:
 
-### Key Components
-
-1. **Driver (`driver.py`)**:
-   - Implements the FUSE filesystem operations such as `getattr`, `readdir`, `read`, `write`, `mkdir`, `unlink`, etc.
-   - Uses `pyicloud` to interact with iCloud Drive and fetch file metadata and content.
-   - Caches file and directory metadata to improve performance and reduce API calls.
-
-2. **Configuration (`config.example.yaml`)**:
-   - Stores iCloud credentials and FUSE options.
-   - Allows customization of cache directory and mount options.
-
-3. **Systemd Service (`icloud.service`)**:
-   - Manages the lifecycle of the FUSE filesystem.
-   - Automatically mounts iCloud Drive on system startup.
-
-4. **Makefile**:
-   - Automates the installation and uninstallation process.
-   - Copies necessary files to appropriate locations and sets up the systemd service.
-
-### Caching Mechanism
-
-The driver caches file and directory metadata to reduce the number of API calls to iCloud. Cached data is stored in memory and expires after 5 minutes. This improves performance when accessing frequently used files and directories.
-
-### Two-Factor Authentication (2FA)
-
-If your iCloud account requires 2FA, the driver will prompt you to enter the verification code during initialization. The code is validated using the `pyicloud` library.
-
-### Supported Operations
-
-- **File Operations**: Read, write, truncate, delete, rename.
-- **Directory Operations**: Create, delete, list contents.
-- **Metadata Operations**: Get file attributes, set file times (mocked).
-
-## Uninstallation
-
-To uninstall the driver and remove all related files:
-
-1. Stop and disable the systemd service:
-   ```bash
-   sudo systemctl stop icloud
-   sudo systemctl disable icloud
-   ```
-
-2. Run the `Makefile` uninstall target:
-   ```bash
-   make uninstall
-   ```
-
-3. Verify that all files have been removed:
-   - `/usr/local/bin/icloud`
-   - `/etc/icloud/`
-   - `/etc/systemd/system/icloud.service`
-   - `/tmp/icloud/`
+```bash
+sudo apt-get update
+sudo apt-get install -y fuse libfuse-dev pkg-config python3-venv
+```
 
 ## Troubleshooting
 
-- **Debug Logging**:
-  - Enable debug logging by running the driver with the `-f` (foreground), `-v` (verbose), and `-d` (FUSE debug) options:
-    ```bash
-    ./driver.py -fvd ~/iCloud
-    ```
+### Service won’t start
 
-- **Log File**:
-  - Check the log file at `/var/log/icloud.log` for detailed error messages.
+```bash
+./icloudctl status
+./icloudctl logs
+```
 
-- **Permissions**:
-  - Ensure that the mount point directory has the correct permissions for the user running the service.
+### Auth/2FA errors
 
-## License
+Run again:
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+```bash
+./icloudctl auth
+./icloudctl restart
+```
+
+### Check setup health
+
+```bash
+./icloudctl doctor
+```
