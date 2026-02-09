@@ -59,6 +59,8 @@ class ICloudFS(fuse.Fuse):
 
         # Content cache: path -> (content, timestamp)
         self.content_cache = {}
+        # Tracks files modified locally and pending upload
+        self.dirty_paths = set()
 
         # File attributes cache: path -> (attrs, timestamp)
         self.attr_cache = {}
@@ -206,6 +208,21 @@ class ICloudFS(fuse.Fuse):
             self.logger.debug("Path was /")
             return attrs
 
+        # If file is newly created locally and not uploaded yet, synthesize attrs.
+        with self.cache_lock:
+            if path in self.content_cache:
+                content, _ = self.content_cache[path]
+                attrs.st_mode = stat.S_IFREG | 0o644
+                attrs.st_nlink = 1
+                attrs.st_size = len(content)
+                attrs.st_ctime = now
+                attrs.st_mtime = now
+                attrs.st_atime = now
+                attrs.st_uid = os.getuid()
+                attrs.st_gid = os.getgid()
+                self.attr_cache[path] = (attrs, now)
+                return attrs
+
         item = self._get_drive_item(path)
         if item is None:
             self.logger.error("Item not found")
@@ -278,7 +295,16 @@ class ICloudFS(fuse.Fuse):
                 else:
                     return -errno.ENOTDIR
 
+                # Include locally-created (not-yet-uploaded) files in directory listing.
                 with self.cache_lock:
+                    prefix = path.rstrip("/") + "/" if path != "/" else "/"
+                    for cached_path in self.content_cache.keys():
+                        if cached_path.startswith(prefix):
+                            rel = cached_path[len(prefix):]
+                            if rel and "/" not in rel:
+                                entries.append(rel)
+
+                    entries = list(dict.fromkeys(entries))
                     self.dir_cache[path] = (entries, time.time())
             except Exception as e:
                 self.logger.error(f"Error listing directory {path}: {str(e)}")
@@ -290,34 +316,32 @@ class ICloudFS(fuse.Fuse):
 
     def open(self, path, flags):
         """Open a file (does not return file descriptor, just checks for errors)"""
-        # self.logger.debug(f"open: {path}, flags: {flags}")
-
-        # item = self._get_drive_item(path)
-        # if item is None:
-        #     self.logger.error("open: Item is none")
-        #     return -errno.ENOENT
-
-        # fd = self._get_next_fd()
-        # self.fd_map[fd] = path
-        # self.logger.debug("open: Returning file descriptor: " + str(fd))
-        # return fd
-
         self.logger.debug(f"open: {path}, flags: {flags}")
 
-        # Check if the file exists
+        with self.cache_lock:
+            if path in self.content_cache:
+                return 0
+
         item = self._get_drive_item(path)
         if item is None:
+            # Allow create/append/truncate style opens to proceed for new files.
+            if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
+                with self.cache_lock:
+                    if path not in self.content_cache:
+                        self.content_cache[path] = (b"", time.time())
+                return 0
+
             self.logger.error(f"File not found: {path}")
-            raise fuse.FuseOSError(errno.ENOENT)  # Return "No such file or directory"
+            return -errno.ENOENT
 
-        # If the file is read-only but flags indicate write access, deny it
-        if (flags & os.O_WRONLY or flags & os.O_RDWR) and not (
-            item.get("writable", True)
-        ):
-            self.logger.error(f"File is not writable: {path}")
-            raise fuse.FuseOSError(errno.EACCES)  # Return "Permission denied"
+        return 0
 
-        # Return 0 on success (FUSE does not expect a file descriptor)
+    def create(self, path, mode, flags=None):
+        """Create a new file"""
+        self.logger.debug(f"create: {path}, mode: {mode}, flags: {flags}")
+        with self.cache_lock:
+            self.content_cache[path] = (b"", time.time())
+            self.dirty_paths.add(path)
         return 0
 
     def read(self, path, size, offset):
@@ -372,6 +396,7 @@ class ICloudFS(fuse.Fuse):
                         new_content = buf
 
                 self.content_cache[path] = (new_content, time.time())
+                self.dirty_paths.add(path)
 
             return len(buf)
         except Exception as e:
@@ -389,10 +414,9 @@ class ICloudFS(fuse.Fuse):
 
         try:
             with self.cache_lock:
-                if path in self.content_cache:
+                if path in self.content_cache and path in self.dirty_paths:
                     content, timestamp = self.content_cache[path]
 
-                    # Check if we need to upload
                     parent_path = os.path.dirname(path)
                     filename = os.path.basename(path)
 
@@ -400,12 +424,27 @@ class ICloudFS(fuse.Fuse):
                     if parent is None:
                         return -errno.ENOENT
 
-                    # TODO: Upload the file to iCloud. BytesIO object has no attribute 'name'
-                    # parent.upload(BytesIO(content))
+                    # Replace existing file when overwriting
+                    existing = self._get_drive_item(path)
+                    if existing is not None:
+                        try:
+                            existing.delete()
+                        except Exception:
+                            pass
 
-                    # Invalidate caches for this path
+                    # pyicloud expects file-like objects with a .name
+                    file_obj = BytesIO(content)
+                    file_obj.name = filename
+                    parent.upload(file_obj)
+
+                    # Mark sync complete for this path
+                    self.dirty_paths.discard(path)
+
+                    # Invalidate caches for this path and parent directory listing
                     if path in self.attr_cache:
                         del self.attr_cache[path]
+                    if parent_path in self.dir_cache:
+                        del self.dir_cache[parent_path]
 
             # Clean up file descriptor
             for fd, p in list(self.fd_map.items()):
@@ -581,6 +620,8 @@ class ICloudFS(fuse.Fuse):
                             time.time(),
                         )
 
+                self.dirty_paths.add(path)
+
             return 0
         except Exception as e:
             self.logger.error(f"Error truncating file {path}: {str(e)}")
@@ -597,6 +638,7 @@ class ICloudFS(fuse.Fuse):
         # Initialize with empty content
         with self.cache_lock:
             self.content_cache[path] = (b"", time.time())
+            self.dirty_paths.add(path)
 
         return 0
 
