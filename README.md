@@ -58,6 +58,14 @@ sudo apt-get update
 sudo apt-get install -y fuse libfuse-dev pkg-config python3-venv
 ```
 
+## Fedora/RHEL prerequisites
+
+You need FUSE + Python tooling installed once:
+
+```bash
+sudo dnf install python3-devel fuse fuse-libs fuse-devel gcc make
+```
+
 ## Troubleshooting
 
 ### Service won’t start
