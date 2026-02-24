@@ -58,6 +58,12 @@ sudo apt-get update
 sudo apt-get install -y fuse libfuse-dev pkg-config python3-venv
 ```
 
+## Fedora prerequisites
+
+```bash
+sudo dnf install python3-devel fuse fuse-libs fuse-devel gcc make
+```
+
 ## Troubleshooting
 
 ### Service won’t start
