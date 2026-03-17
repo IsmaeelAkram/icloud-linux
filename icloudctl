@@ -110,6 +110,10 @@ cmd_configure() {
 username: "$email"
 password: "$password"
 cache_dir: "$CACHE_DIR"
+warmup_mode: "background"
+conflict_mode: "copy"
+upload_interval_seconds: 30
+remote_refresh_interval_seconds: 300
 cookie_dir: "$CONFIG_DIR/cookies"
 fuse_options:
   allow_other: false
@@ -131,6 +135,21 @@ cmd_stop() { systemctl --user stop icloud.service; }
 cmd_restart() { systemctl --user restart icloud.service; systemctl --user --no-pager status icloud.service; }
 cmd_status() { systemctl --user --no-pager status icloud.service; }
 cmd_logs() { journalctl --user -u icloud.service -f; }
+cmd_clear_cache() {
+  local was_active=0
+  systemctl --user is-active --quiet icloud.service && was_active=1 || true
+  systemctl --user stop icloud.service >/dev/null 2>&1 || true
+  rm -rf "$CACHE_DIR"
+  mkdir -p "$CACHE_DIR"
+  echo "Cleared persistent cache under $CACHE_DIR"
+  if [[ "$was_active" -eq 1 ]]; then
+    echo "Restarting service to rebuild cache..."
+    systemctl --user start icloud.service
+    systemctl --user --no-pager status icloud.service
+  else
+    echo "Service is stopped. Start it with './icloudctl start' to rebuild cache."
+  fi
+}
 
 cmd_uninstall() {
   local purge="${1:-}"
@@ -193,6 +212,7 @@ Commands:
   init [mount_dir]         Initialize venv/config/service files
   configure [email]        Write config.yaml with credentials
   auth                     Run interactive 2FA bootstrap
+  clear-cache              Remove local mirror/state and rebuild on next start
   start|stop|restart       Service control
   status                   Show service status
   logs                     Tail service logs
@@ -209,6 +229,7 @@ main() {
     init) cmd_init "$@" ;;
     configure) cmd_configure "$@" ;;
     auth) cmd_auth ;;
+    clear-cache) cmd_clear_cache ;;
     start) cmd_start ;;
     stop) cmd_stop ;;
     restart) cmd_restart ;;

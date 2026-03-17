@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 
-import os
 import datetime
-import sys
-import stat
 import errno
-import time
-import argparse
+import hashlib
 import logging
+import os
+import shutil
+import sqlite3
+import stat
+import sys
+import tempfile
 import threading
-import yaml
-import jsonpickle
-from collections import defaultdict
-import fuse
-from fuse import Fuse
-from pyicloud import PyiCloudService
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
-# Fix for __version__ check in fuse.py
+import fuse
+import yaml
+from fuse import Fuse
+from pyicloud import PyiCloudService
+from pyicloud.services.drive import DriveNode
+
+
 if not hasattr(fuse, "__version__"):
     fuse.__version__ = "0.2"
 
-# Ensure all operations are defined
 fuse.fuse_python_api = (0, 2)
+
+
+ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
 
 
 class Stat(fuse.Stat):
@@ -39,68 +46,1207 @@ class Stat(fuse.Stat):
         self.st_ctime = 0
 
 
-class ICloudFS(fuse.Fuse):
-    """
-    A FUSE driver for mounting iCloud as a filesystem using Fuse2 with fuse-python.
-    """
+def parse_remote_time(value):
+    if not value:
+        return int(time.time())
+    try:
+        parsed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return int(time.time())
+    return int(calendar_timegm(parsed.timetuple()))
 
+
+def calendar_timegm(timetuple):
+    return int(datetime.datetime(*timetuple[:6], tzinfo=datetime.timezone.utc).timestamp())
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def row_to_dict(row):
+    return dict(row) if row is not None else None
+
+
+class SyncState:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.lock = threading.RLock()
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init_db()
+
+    def _init_db(self):
+        with self.lock:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS entries (
+                    path TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    parent_path TEXT NOT NULL,
+                    remote_drivewsid TEXT,
+                    remote_docwsid TEXT,
+                    remote_etag TEXT,
+                    remote_zone TEXT,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    mtime INTEGER NOT NULL DEFAULT 0,
+                    hydrated INTEGER NOT NULL DEFAULT 0,
+                    dirty INTEGER NOT NULL DEFAULT 0,
+                    tombstone INTEGER NOT NULL DEFAULT 0,
+                    local_sha256 TEXT,
+                    last_synced_at INTEGER,
+                    synced_path TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_entries_remote_drivewsid
+                    ON entries(remote_drivewsid);
+                CREATE INDEX IF NOT EXISTS idx_entries_dirty
+                    ON entries(dirty, tombstone);
+                CREATE TABLE IF NOT EXISTS pending_ops (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    op TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    target_path TEXT,
+                    queued_at INTEGER NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                );
+                """
+            )
+            self.conn.commit()
+
+    def upsert_entry(self, entry):
+        payload = {
+            "path": entry["path"],
+            "type": entry["type"],
+            "parent_path": entry["parent_path"],
+            "remote_drivewsid": entry.get("remote_drivewsid"),
+            "remote_docwsid": entry.get("remote_docwsid"),
+            "remote_etag": entry.get("remote_etag"),
+            "remote_zone": entry.get("remote_zone"),
+            "size": int(entry.get("size", 0) or 0),
+            "mtime": int(entry.get("mtime", 0) or 0),
+            "hydrated": int(bool(entry.get("hydrated", False))),
+            "dirty": int(bool(entry.get("dirty", False))),
+            "tombstone": int(bool(entry.get("tombstone", False))),
+            "local_sha256": entry.get("local_sha256"),
+            "last_synced_at": entry.get("last_synced_at"),
+            "synced_path": entry.get("synced_path", entry["path"]),
+        }
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO entries (
+                    path, type, parent_path, remote_drivewsid, remote_docwsid, remote_etag,
+                    remote_zone, size, mtime, hydrated, dirty, tombstone, local_sha256,
+                    last_synced_at, synced_path
+                ) VALUES (
+                    :path, :type, :parent_path, :remote_drivewsid, :remote_docwsid, :remote_etag,
+                    :remote_zone, :size, :mtime, :hydrated, :dirty, :tombstone, :local_sha256,
+                    :last_synced_at, :synced_path
+                )
+                ON CONFLICT(path) DO UPDATE SET
+                    type = excluded.type,
+                    parent_path = excluded.parent_path,
+                    remote_drivewsid = excluded.remote_drivewsid,
+                    remote_docwsid = excluded.remote_docwsid,
+                    remote_etag = excluded.remote_etag,
+                    remote_zone = excluded.remote_zone,
+                    size = excluded.size,
+                    mtime = excluded.mtime,
+                    hydrated = excluded.hydrated,
+                    dirty = excluded.dirty,
+                    tombstone = excluded.tombstone,
+                    local_sha256 = excluded.local_sha256,
+                    last_synced_at = excluded.last_synced_at,
+                    synced_path = excluded.synced_path
+                """,
+                payload,
+            )
+            self.conn.commit()
+
+    def get_entry(self, path):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM entries WHERE path = ?",
+                (path,),
+            ).fetchone()
+        return row_to_dict(row)
+
+    def get_entry_by_remote_id(self, remote_drivewsid):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM entries WHERE remote_drivewsid = ?",
+                (remote_drivewsid,),
+            ).fetchone()
+        return row_to_dict(row)
+
+    def list_entries(self):
+        with self.lock:
+            rows = self.conn.execute("SELECT * FROM entries ORDER BY path").fetchall()
+        return [dict(row) for row in rows]
+
+    def count_entries(self):
+        with self.lock:
+            row = self.conn.execute("SELECT COUNT(*) AS count FROM entries").fetchone()
+        return int(row["count"])
+
+    def list_unhydrated_paths(self):
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT path FROM entries
+                WHERE type = 'file' AND tombstone = 0 AND hydrated = 0
+                ORDER BY path
+                """
+            ).fetchall()
+        return [row["path"] for row in rows]
+
+    def list_dirty_entries(self):
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM entries
+                WHERE dirty = 1 OR tombstone = 1
+                ORDER BY path
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_hydrated(self, path, local_sha256=None, size=None, mtime=None):
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET hydrated = 1,
+                    local_sha256 = COALESCE(?, local_sha256),
+                    size = COALESCE(?, size),
+                    mtime = COALESCE(?, mtime)
+                WHERE path = ?
+                """,
+                (local_sha256, size, mtime, path),
+            )
+            self.conn.commit()
+
+    def mark_dirty(self, path, size=None, mtime=None, hydrated=None, local_sha256=None):
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET dirty = 1,
+                    tombstone = 0,
+                    size = COALESCE(?, size),
+                    mtime = COALESCE(?, mtime),
+                    hydrated = COALESCE(?, hydrated),
+                    local_sha256 = COALESCE(?, local_sha256)
+                WHERE path = ?
+                """,
+                (size, mtime, hydrated, local_sha256, path),
+            )
+            self.conn.commit()
+
+    def mark_tombstone(self, path):
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET tombstone = 1,
+                    dirty = 1
+                WHERE path = ?
+                """,
+                (path,),
+            )
+            self.conn.commit()
+
+    def mark_clean(self, path, remote_meta=None, local_sha256=None):
+        remote_meta = remote_meta or {}
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET dirty = 0,
+                    tombstone = 0,
+                    hydrated = CASE
+                        WHEN type = 'file' THEN hydrated
+                        ELSE 1
+                    END,
+                    remote_drivewsid = COALESCE(?, remote_drivewsid),
+                    remote_docwsid = COALESCE(?, remote_docwsid),
+                    remote_etag = COALESCE(?, remote_etag),
+                    remote_zone = COALESCE(?, remote_zone),
+                    size = COALESCE(?, size),
+                    mtime = COALESCE(?, mtime),
+                    local_sha256 = COALESCE(?, local_sha256),
+                    last_synced_at = ?,
+                    synced_path = path
+                WHERE path = ?
+                """,
+                (
+                    remote_meta.get("remote_drivewsid"),
+                    remote_meta.get("remote_docwsid"),
+                    remote_meta.get("remote_etag"),
+                    remote_meta.get("remote_zone"),
+                    remote_meta.get("size"),
+                    remote_meta.get("mtime"),
+                    local_sha256,
+                    int(time.time()),
+                    path,
+                ),
+            )
+            self.conn.execute(
+                "DELETE FROM pending_ops WHERE path = ? OR target_path = ?",
+                (path, path),
+            )
+            self.conn.commit()
+
+    def remove_entry(self, path):
+        with self.lock:
+            self.conn.execute("DELETE FROM entries WHERE path = ?", (path,))
+            self.conn.execute(
+                "DELETE FROM pending_ops WHERE path = ? OR target_path = ?",
+                (path, path),
+            )
+            self.conn.commit()
+
+    def remove_subtree(self, path):
+        prefix = path.rstrip("/") + "/"
+        with self.lock:
+            self.conn.execute(
+                "DELETE FROM entries WHERE path = ? OR path LIKE ?",
+                (path, prefix + "%"),
+            )
+            self.conn.execute(
+                "DELETE FROM pending_ops WHERE path = ? OR path LIKE ? OR target_path = ? OR target_path LIKE ?",
+                (path, prefix + "%", path, prefix + "%"),
+            )
+            self.conn.commit()
+
+    def rename_tree(self, oldpath, newpath, root_dirty=True, update_synced=False):
+        entries = self._fetch_subtree(oldpath)
+        if not entries:
+            return
+        prefix = oldpath.rstrip("/") + "/"
+        with self.lock:
+            for entry in entries:
+                current = entry["path"]
+                suffix = "" if current == oldpath else current[len(prefix) :]
+                updated = newpath if not suffix else newpath.rstrip("/") + "/" + suffix
+                updated_parent = os.path.dirname(updated) or "/"
+                dirty = 1 if (root_dirty and current == oldpath) else entry["dirty"]
+                self.conn.execute(
+                    """
+                    UPDATE entries
+                    SET path = ?,
+                        parent_path = ?,
+                        dirty = ?,
+                        synced_path = CASE
+                            WHEN ? = 1 AND synced_path = ? THEN ?
+                            WHEN ? = 1 AND synced_path LIKE ? THEN ? || substr(synced_path, ?)
+                            ELSE synced_path
+                        END
+                    WHERE path = ?
+                    """,
+                    (
+                        updated,
+                        updated_parent,
+                        dirty,
+                        int(update_synced),
+                        oldpath,
+                        newpath,
+                        int(update_synced),
+                        prefix + "%",
+                        newpath.rstrip("/") + "/",
+                        len(prefix) + 1,
+                        current,
+                    ),
+                )
+            self.conn.execute(
+                """
+                UPDATE pending_ops
+                SET path = CASE
+                    WHEN path = ? THEN ?
+                    WHEN path LIKE ? THEN ? || substr(path, ?)
+                    ELSE path
+                END,
+                target_path = CASE
+                    WHEN target_path = ? THEN ?
+                    WHEN target_path LIKE ? THEN ? || substr(target_path, ?)
+                    ELSE target_path
+                END
+                """,
+                (
+                    oldpath,
+                    newpath,
+                    prefix + "%",
+                    newpath.rstrip("/") + "/",
+                    len(prefix) + 1,
+                    oldpath,
+                    newpath,
+                    prefix + "%",
+                    newpath.rstrip("/") + "/",
+                    len(prefix) + 1,
+                ),
+            )
+            self.conn.commit()
+
+    def mark_synced_subtree(self, path):
+        prefix = path.rstrip("/") + "/"
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET synced_path = path,
+                    dirty = CASE
+                        WHEN path = ? THEN 0
+                        ELSE dirty
+                    END,
+                    tombstone = CASE
+                        WHEN path = ? THEN 0
+                        ELSE tombstone
+                    END,
+                    last_synced_at = ?
+                WHERE path = ? OR path LIKE ?
+                """,
+                (path, path, int(time.time()), path, prefix + "%"),
+            )
+            self.conn.commit()
+
+    def detach_subtree_as_conflict(self, oldpath, newpath):
+        entries = self._fetch_subtree(oldpath)
+        if not entries:
+            return
+        prefix = oldpath.rstrip("/") + "/"
+        with self.lock:
+            for entry in entries:
+                current = entry["path"]
+                suffix = "" if current == oldpath else current[len(prefix) :]
+                updated = newpath if not suffix else newpath.rstrip("/") + "/" + suffix
+                updated_parent = os.path.dirname(updated) or "/"
+                self.conn.execute(
+                    """
+                    UPDATE entries
+                    SET path = ?,
+                        parent_path = ?,
+                        remote_drivewsid = NULL,
+                        remote_docwsid = NULL,
+                        remote_etag = NULL,
+                        remote_zone = NULL,
+                        synced_path = NULL,
+                        dirty = 1,
+                        tombstone = 0
+                    WHERE path = ?
+                    """,
+                    (updated, updated_parent, current),
+                )
+            self.conn.commit()
+
+    def clear_remote_identity(self, path):
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET remote_drivewsid = NULL,
+                    remote_docwsid = NULL,
+                    remote_etag = NULL,
+                    remote_zone = NULL,
+                    synced_path = NULL,
+                    dirty = 1,
+                    tombstone = 0
+                WHERE path = ?
+                """,
+                (path,),
+            )
+            self.conn.commit()
+
+    def queue_op(self, op, path, target_path=None):
+        now = int(time.time())
+        with self.lock:
+            if op == "delete":
+                existing_create = self.conn.execute(
+                    "SELECT id FROM pending_ops WHERE path = ? AND op IN ('create', 'mkdir')",
+                    (path,),
+                ).fetchone()
+                if existing_create:
+                    self.conn.execute("DELETE FROM pending_ops WHERE path = ?", (path,))
+                    self.conn.commit()
+                    return
+            self.conn.execute(
+                """
+                INSERT INTO pending_ops (op, path, target_path, queued_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (op, path, target_path, now),
+            )
+            self.conn.commit()
+
+    def _fetch_subtree(self, path):
+        prefix = path.rstrip("/") + "/"
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM entries
+                WHERE path = ? OR path LIKE ?
+                ORDER BY LENGTH(path) ASC, path ASC
+                """,
+                (path, prefix + "%"),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
+class LocalMirror:
+    def __init__(self, cache_dir):
+        self.cache_dir = cache_dir
+        self.root = os.path.join(cache_dir, "mirror")
+        self.tmp_dir = os.path.join(cache_dir, "tmp")
+        os.makedirs(self.root, exist_ok=True)
+        os.makedirs(self.tmp_dir, exist_ok=True)
+
+    def local_path(self, path):
+        normalized = os.path.normpath(path)
+        if normalized == ".":
+            normalized = "/"
+        if not normalized.startswith("/"):
+            normalized = "/" + normalized
+        relative = normalized.lstrip("/")
+        local = os.path.abspath(os.path.join(self.root, relative))
+        if local != self.root and not local.startswith(self.root + os.sep):
+            raise ValueError(f"Path escapes mirror root: {path}")
+        return local
+
+    def ensure_dir(self, path):
+        os.makedirs(self.local_path(path), exist_ok=True)
+
+    def ensure_parent(self, path):
+        parent = os.path.dirname(path) or "/"
+        os.makedirs(self.local_path(parent), exist_ok=True)
+
+    def materialize_placeholder(self, path, size, mtime):
+        local = self.local_path(path)
+        self.ensure_parent(path)
+        if os.path.isdir(local):
+            shutil.rmtree(local)
+        with open(local, "wb") as handle:
+            handle.truncate(int(size or 0))
+        os.utime(local, (mtime, mtime))
+
+    def write_atomic_bytes(self, path, content, mtime=None):
+        self.ensure_parent(path)
+        local = self.local_path(path)
+        fd, tmp_path = tempfile.mkstemp(dir=self.tmp_dir)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+            os.replace(tmp_path, local)
+            if mtime is not None:
+                os.utime(local, (mtime, mtime))
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def read(self, path, size, offset):
+        local = self.local_path(path)
+        with open(local, "rb") as handle:
+            handle.seek(offset)
+            return handle.read(size)
+
+    def write(self, path, buf, offset):
+        self.ensure_parent(path)
+        local = self.local_path(path)
+        mode = "r+b" if os.path.exists(local) else "w+b"
+        with open(local, mode) as handle:
+            handle.seek(offset)
+            handle.write(buf)
+            handle.flush()
+        return len(buf)
+
+    def truncate(self, path, length):
+        self.ensure_parent(path)
+        local = self.local_path(path)
+        mode = "r+b" if os.path.exists(local) else "w+b"
+        with open(local, mode) as handle:
+            handle.truncate(length)
+
+    def create_file(self, path):
+        self.ensure_parent(path)
+        local = self.local_path(path)
+        with open(local, "ab"):
+            pass
+
+    def listdir(self, path):
+        return os.listdir(self.local_path(path))
+
+    def exists(self, path):
+        return os.path.exists(self.local_path(path))
+
+    def is_dir(self, path):
+        return os.path.isdir(self.local_path(path))
+
+    def remove_file(self, path):
+        os.unlink(self.local_path(path))
+
+    def remove_dir(self, path):
+        os.rmdir(self.local_path(path))
+
+    def remove_tree(self, path):
+        local = self.local_path(path)
+        if os.path.isdir(local):
+            shutil.rmtree(local)
+        elif os.path.exists(local):
+            os.unlink(local)
+
+    def rename_path(self, oldpath, newpath):
+        self.ensure_parent(newpath)
+        os.replace(self.local_path(oldpath), self.local_path(newpath))
+
+    def stat_local(self, path):
+        return os.lstat(self.local_path(path))
+
+    def statvfs(self):
+        return os.statvfs(self.root)
+
+    def set_mtime(self, path, mtime):
+        local = self.local_path(path)
+        os.utime(local, (mtime, mtime))
+
+    def file_sha256(self, path):
+        return sha256_file(self.local_path(path))
+
+
+class ICloudSyncEngine:
+    def __init__(
+        self,
+        api,
+        mirror,
+        state,
+        logger,
+        warmup_mode="background",
+        conflict_mode="copy",
+        upload_interval_seconds=30,
+        remote_refresh_interval_seconds=300,
+        warmup_workers=4,
+    ):
+        self.api = api
+        self.mirror = mirror
+        self.state = state
+        self.logger = logger
+        self.warmup_mode = warmup_mode if warmup_mode in {"background", "lazy"} else "background"
+        self.conflict_mode = conflict_mode if conflict_mode in {"copy"} else "copy"
+        self.upload_interval_seconds = upload_interval_seconds
+        self.remote_refresh_interval_seconds = remote_refresh_interval_seconds
+        self.executor = ThreadPoolExecutor(max_workers=warmup_workers, thread_name_prefix="warmup")
+        self.stop_event = threading.Event()
+        self.path_locks = {}
+        self.path_locks_lock = threading.Lock()
+        self.scheduled_downloads = set()
+        self.downloads_lock = threading.Lock()
+        self.download_retry_attempts = {}
+        self.download_retry_timers = {}
+        self.threads = []
+        self.hydration_total = 0
+        self.hydration_completed = 0
+        self.hydration_progress_lock = threading.Lock()
+
+    def start(self):
+        if self.has_persistent_cache():
+            self.logger.info("Using persistent local cache from %s", self.mirror.root)
+            self._reconcile_persistent_cache()
+            if self.warmup_mode == "background":
+                self._schedule_all_unhydrated()
+        else:
+            self.logger.info("Persistent cache not initialized yet; performing first remote crawl")
+            self.initial_scan()
+            if self.warmup_mode == "background":
+                self._schedule_all_unhydrated()
+        self._start_background_threads()
+
+    def _start_background_threads(self):
+        upload_thread = threading.Thread(target=self._upload_loop, name="icloud-upload", daemon=True)
+        refresh_thread = threading.Thread(target=self._refresh_loop, name="icloud-refresh", daemon=True)
+        upload_thread.start()
+        refresh_thread.start()
+        self.threads.extend([upload_thread, refresh_thread])
+
+    def has_persistent_cache(self):
+        return self.state.count_entries() > 0 and os.path.isdir(self.mirror.root)
+
+    def initial_scan(self):
+        snapshot = self._crawl_remote_snapshot()
+        self._apply_remote_snapshot(snapshot)
+
+    def _reconcile_persistent_cache(self):
+        entries = self.state.list_entries()
+        missing_files = 0
+        recreated_dirs = 0
+
+        for entry in entries:
+            path = entry["path"]
+            if entry["tombstone"]:
+                continue
+            if entry["type"] == "folder":
+                if not self.mirror.exists(path):
+                    self.mirror.ensure_dir(path)
+                    recreated_dirs += 1
+                continue
+
+            if self.mirror.exists(path):
+                stats = self.mirror.stat_local(path)
+                checksum = self.mirror.file_sha256(path)
+                self.state.upsert_entry(
+                    {
+                        **entry,
+                        "size": stats.st_size,
+                        "mtime": int(stats.st_mtime),
+                        "hydrated": True,
+                        "local_sha256": checksum,
+                    }
+                )
+                continue
+
+            missing_files += 1
+            if entry["remote_drivewsid"]:
+                self.mirror.materialize_placeholder(path, entry["size"], entry["mtime"])
+                self.state.upsert_entry({**entry, "hydrated": entry["size"] == 0})
+            else:
+                self.mirror.create_file(path)
+                stats = self.mirror.stat_local(path)
+                checksum = self.mirror.file_sha256(path)
+                self.state.upsert_entry(
+                    {
+                        **entry,
+                        "size": stats.st_size,
+                        "mtime": int(stats.st_mtime),
+                        "hydrated": True,
+                        "local_sha256": checksum,
+                    }
+                )
+
+        self.logger.info(
+            "Persistent cache ready: %s entries, %s directories recreated, %s files queued for hydration",
+            len(entries),
+            recreated_dirs,
+            missing_files,
+        )
+
+    def ensure_local_file(self, path):
+        entry = self.state.get_entry(path)
+        if not entry or entry["type"] != "file" or entry["tombstone"]:
+            return
+        if entry["hydrated"] and self.mirror.exists(path):
+            return
+
+        lock = self._path_lock(path)
+        with lock:
+            entry = self.state.get_entry(path)
+            if not entry or entry["type"] != "file" or entry["tombstone"]:
+                return
+            if entry["hydrated"] and self.mirror.exists(path):
+                return
+            if not entry["remote_drivewsid"]:
+                if not self.mirror.exists(path):
+                    self.mirror.create_file(path)
+                checksum = self.mirror.file_sha256(path)
+                stats = self.mirror.stat_local(path)
+                self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
+                return
+
+            self.logger.debug("Hydrating %s", path)
+            node = self._node_from_entry(entry)
+            content = node.open(stream=True).raw.read()
+            self.mirror.write_atomic_bytes(path, content, entry["mtime"])
+            stats = self.mirror.stat_local(path)
+            checksum = self.mirror.file_sha256(path)
+            self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
+
+    def _crawl_remote_snapshot(self):
+        self.logger.info("Starting remote metadata crawl")
+        snapshot = {}
+        queue = deque()
+        root = self.api.drive.root
+        queue.append((root, "/"))
+        started_at = time.time()
+        last_progress_log = started_at
+        scanned_folders = 0
+
+        while queue:
+            node, path = queue.popleft()
+            scanned_folders += 1
+            try:
+                children = node.get_children(force=True)
+            except Exception as exc:
+                self.logger.error("Failed to enumerate %s: %s", path, exc)
+                continue
+
+            for child in children:
+                child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
+                meta = self._node_to_meta(child, child_path)
+                snapshot[meta["remote_drivewsid"]] = meta
+                if meta["type"] == "folder":
+                    queue.append((child, child_path))
+
+            now = time.time()
+            if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
+                self.logger.info(
+                    "Remote metadata crawl progress: %s folders scanned, %s entries discovered, %s folders queued",
+                    scanned_folders,
+                    len(snapshot),
+                    len(queue),
+                )
+                last_progress_log = now
+
+        self.logger.info(
+            "Remote metadata crawl complete: %s entries across %s folders in %.1fs",
+            len(snapshot),
+            scanned_folders,
+            time.time() - started_at,
+        )
+        return snapshot
+
+    def _apply_remote_snapshot(self, snapshot):
+        remote_ids = set(snapshot.keys())
+
+        for meta in snapshot.values():
+            existing = self.state.get_entry_by_remote_id(meta["remote_drivewsid"])
+            if existing and existing["dirty"] and self._entry_conflicts(existing, meta):
+                self._resolve_conflict(existing)
+                existing = None
+
+            if existing is None:
+                path_entry = self.state.get_entry(meta["path"])
+                if path_entry and path_entry["dirty"]:
+                    self._resolve_conflict(path_entry)
+                self._materialize_remote_entry(meta)
+                continue
+
+            if existing["dirty"]:
+                continue
+
+            self._refresh_clean_entry(existing, meta)
+
+        for entry in self.state.list_entries():
+            remote_id = entry["remote_drivewsid"]
+            if not remote_id or remote_id in remote_ids:
+                continue
+            if entry["dirty"]:
+                self.logger.warning("Remote deleted dirty path %s; keeping local copy for upload", entry["path"])
+                self.state.clear_remote_identity(entry["path"])
+                continue
+            self.logger.info("Removing clean path deleted remotely: %s", entry["path"])
+            self.mirror.remove_tree(entry["path"])
+            self.state.remove_subtree(entry["path"])
+
+    def _materialize_remote_entry(self, meta):
+        local_path = meta["path"]
+        if meta["type"] == "folder":
+            self.mirror.ensure_dir(local_path)
+            hydrated = True
+        else:
+            self.mirror.materialize_placeholder(local_path, meta["size"], meta["mtime"])
+            hydrated = meta["size"] == 0
+        self.state.upsert_entry(
+            {
+                **meta,
+                "hydrated": hydrated,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": local_path,
+            }
+        )
+        if meta["type"] == "file" and not hydrated:
+            self._schedule_download(local_path)
+
+    def _refresh_clean_entry(self, entry, meta):
+        oldpath = entry["path"]
+        newpath = meta["path"]
+        if oldpath != newpath and self.mirror.exists(oldpath):
+            self.mirror.rename_path(oldpath, newpath)
+            self.state.rename_tree(oldpath, newpath, root_dirty=False, update_synced=True)
+            entry = self.state.get_entry(newpath)
+        elif oldpath != newpath:
+            self.state.rename_tree(oldpath, newpath, root_dirty=False, update_synced=True)
+            entry = self.state.get_entry(newpath)
+
+        if meta["type"] == "folder":
+            self.mirror.ensure_dir(newpath)
+            self.state.upsert_entry(
+                {
+                    **meta,
+                    "hydrated": True,
+                    "dirty": False,
+                    "tombstone": False,
+                    "local_sha256": entry.get("local_sha256") if entry else None,
+                    "last_synced_at": entry.get("last_synced_at") if entry else None,
+                    "synced_path": newpath,
+                }
+            )
+            return
+
+        should_replace = (
+            entry is None
+            or entry["remote_etag"] != meta["remote_etag"]
+            or entry["size"] != meta["size"]
+            or entry["mtime"] != meta["mtime"]
+        )
+        hydrated = bool(entry and entry["hydrated"] and not should_replace)
+        if should_replace:
+            self.mirror.materialize_placeholder(newpath, meta["size"], meta["mtime"])
+            hydrated = meta["size"] == 0
+        self.state.upsert_entry(
+            {
+                **meta,
+                "hydrated": hydrated,
+                "dirty": False,
+                "tombstone": False,
+                "local_sha256": entry.get("local_sha256") if hydrated and entry else None,
+                "last_synced_at": entry.get("last_synced_at") if entry else None,
+                "synced_path": newpath,
+            }
+        )
+        if not hydrated:
+            self._schedule_download(newpath)
+
+    def _resolve_conflict(self, entry):
+        if self.conflict_mode != "copy":
+            self.logger.warning("Unsupported conflict mode %s; falling back to copy", self.conflict_mode)
+        conflict_path = self._conflict_path(entry["path"])
+        self.logger.warning("Conflict on %s; preserving local version as %s", entry["path"], conflict_path)
+        if self.mirror.exists(entry["path"]):
+            self.mirror.rename_path(entry["path"], conflict_path)
+        self.state.detach_subtree_as_conflict(entry["path"], conflict_path)
+        subtree = self.state._fetch_subtree(conflict_path)
+        for child in subtree:
+            self.state.queue_op("conflict-copy", child["path"])
+
+    def _schedule_all_unhydrated(self):
+        paths = self.state.list_unhydrated_paths()
+        total = len(paths)
+        with self.hydration_progress_lock:
+            self.hydration_total = total
+            self.hydration_completed = 0
+        if total:
+            self.logger.info("Background cache warmup scheduled for %s files", total)
+        else:
+            self.logger.info("Background cache warmup skipped; all files already hydrated")
+        for path in paths:
+            self._schedule_download(path)
+
+    def _schedule_download(self, path):
+        self._schedule_download_with_delay(path, 0)
+
+    def _schedule_download_with_delay(self, path, delay_seconds):
+        if self.stop_event.is_set():
+            return
+
+        with self.downloads_lock:
+            if path in self.scheduled_downloads:
+                return
+            self.scheduled_downloads.add(path)
+
+        if delay_seconds <= 0:
+            self.executor.submit(self._download_job, path)
+            return
+
+        timer = threading.Timer(delay_seconds, self._submit_retry_download, args=(path,))
+        timer.daemon = True
+        with self.downloads_lock:
+            self.download_retry_timers[path] = timer
+        timer.start()
+
+    def _submit_retry_download(self, path):
+        with self.downloads_lock:
+            self.download_retry_timers.pop(path, None)
+        if self.stop_event.is_set():
+            with self.downloads_lock:
+                self.scheduled_downloads.discard(path)
+            return
+        self.executor.submit(self._download_job, path)
+
+    def _retry_delay_for_attempt(self, attempt):
+        return min(300, 5 * (2 ** max(0, attempt - 1)))
+
+    def _download_job(self, path):
+        retry_delay = None
+        try:
+            self.ensure_local_file(path)
+            with self.downloads_lock:
+                self.download_retry_attempts.pop(path, None)
+            with self.hydration_progress_lock:
+                self.hydration_completed += 1
+                completed = self.hydration_completed
+                total = self.hydration_total
+            if total and (completed == 1 or completed == total or completed % 25 == 0):
+                self.logger.info(
+                    "Background cache warmup progress: %s/%s files hydrated",
+                    completed,
+                    total,
+                )
+        except Exception as exc:
+            with self.downloads_lock:
+                attempt = self.download_retry_attempts.get(path, 0) + 1
+                self.download_retry_attempts[path] = attempt
+            retry_delay = self._retry_delay_for_attempt(attempt)
+            self.logger.error(
+                "Warmup download failed for %s (attempt %s): %s; retrying in %ss",
+                path,
+                attempt,
+                exc,
+                retry_delay,
+            )
+        finally:
+            with self.downloads_lock:
+                self.scheduled_downloads.discard(path)
+                self.download_retry_timers.pop(path, None)
+            if retry_delay is not None:
+                self._schedule_download_with_delay(path, retry_delay)
+
+    def _upload_loop(self):
+        while not self.stop_event.wait(self.upload_interval_seconds):
+            try:
+                self.sync_dirty_entries()
+            except Exception as exc:
+                self.logger.error("Upload loop failed: %s", exc)
+
+    def _refresh_loop(self):
+        immediate = self.has_persistent_cache()
+        if immediate:
+            try:
+                self.logger.info("Starting background remote refresh from persistent cache")
+                snapshot = self._crawl_remote_snapshot()
+                self._apply_remote_snapshot(snapshot)
+            except Exception as exc:
+                self.logger.error("Initial background refresh failed: %s", exc)
+        while not self.stop_event.wait(self.remote_refresh_interval_seconds):
+            try:
+                snapshot = self._crawl_remote_snapshot()
+                self._apply_remote_snapshot(snapshot)
+            except Exception as exc:
+                self.logger.error("Refresh loop failed: %s", exc)
+
+    def sync_dirty_entries(self):
+        dirty_entries = self.state.list_dirty_entries()
+        if not dirty_entries:
+            return
+
+        tombstones = sorted(
+            [entry for entry in dirty_entries if entry["tombstone"]],
+            key=lambda entry: (entry["path"].count("/"), entry["path"]),
+            reverse=True,
+        )
+        regular = sorted(
+            [entry for entry in dirty_entries if not entry["tombstone"]],
+            key=lambda entry: (entry["type"] != "folder", entry["path"].count("/"), entry["path"]),
+        )
+
+        for entry in tombstones:
+            self._sync_tombstone(entry)
+
+        for entry in regular:
+            fresh = self.state.get_entry(entry["path"])
+            if fresh is None or fresh["tombstone"] or not fresh["dirty"]:
+                continue
+            if fresh["type"] == "folder":
+                self._sync_directory(fresh)
+            else:
+                self._sync_file(fresh)
+
+    def _sync_tombstone(self, entry):
+        if entry["remote_drivewsid"]:
+            try:
+                node = self._node_from_entry(entry)
+                node.delete()
+            except Exception as exc:
+                self.logger.error("Failed deleting remote path %s: %s", entry["path"], exc)
+                return
+        self.state.remove_subtree(entry["path"])
+
+    def _sync_directory(self, entry):
+        parent_node = self._ensure_remote_parent(entry["path"])
+        if parent_node is None:
+            return
+
+        try:
+            if not entry["remote_drivewsid"]:
+                parent_node.mkdir(os.path.basename(entry["path"]))
+                meta = self._refresh_child_meta(os.path.dirname(entry["path"]) or "/", os.path.basename(entry["path"]))
+                self.state.mark_clean(entry["path"], meta)
+                return
+
+            if entry["synced_path"] and entry["synced_path"] != entry["path"]:
+                self._sync_move_or_rename(entry)
+            self.state.mark_synced_subtree(entry["path"])
+        except Exception as exc:
+            self.logger.error("Failed syncing directory %s: %s", entry["path"], exc)
+
+    def _sync_file(self, entry):
+        parent_node = self._ensure_remote_parent(entry["path"])
+        if parent_node is None:
+            return
+
+        try:
+            if not self.mirror.exists(entry["path"]):
+                self.state.mark_tombstone(entry["path"])
+                return
+
+            self.ensure_local_file(entry["path"])
+
+            if entry["remote_drivewsid"] and entry["synced_path"] and entry["synced_path"] != entry["path"]:
+                self._sync_move_or_rename(entry)
+                entry = self.state.get_entry(entry["path"])
+
+            if entry["remote_drivewsid"]:
+                try:
+                    self._node_from_entry(entry).delete()
+                except Exception:
+                    pass
+
+            with open(self.mirror.local_path(entry["path"]), "rb") as handle:
+                file_obj = BytesIO(handle.read())
+            file_obj.name = os.path.basename(entry["path"])
+            parent_node.upload(file_obj)
+
+            meta = self._refresh_child_meta(os.path.dirname(entry["path"]) or "/", os.path.basename(entry["path"]))
+            checksum = self.mirror.file_sha256(entry["path"])
+            self.state.mark_clean(entry["path"], meta, checksum)
+        except Exception as exc:
+            self.logger.error("Failed syncing file %s: %s", entry["path"], exc)
+
+    def _sync_move_or_rename(self, entry):
+        synced_path = entry["synced_path"]
+        if not synced_path:
+            return
+        old_parent = os.path.dirname(synced_path) or "/"
+        new_parent = os.path.dirname(entry["path"]) or "/"
+        old_name = os.path.basename(synced_path)
+        new_name = os.path.basename(entry["path"])
+
+        node = self._node_from_entry(entry)
+        if old_parent != new_parent:
+            destination = self._remote_node_for_path(new_parent)
+            if destination is None:
+                raise RuntimeError(f"Remote parent not available for {new_parent}")
+            self.api.drive.move_nodes_to_node([node], destination)
+            node = self._refresh_node_by_id(entry["remote_drivewsid"])
+        if old_name != new_name:
+            node.rename(new_name)
+
+    def _ensure_remote_parent(self, path):
+        parent_path = os.path.dirname(path) or "/"
+        if parent_path == "/":
+            return self.api.drive.root
+        parent_entry = self.state.get_entry(parent_path)
+        if not parent_entry:
+            return None
+        if parent_entry["dirty"]:
+            self._sync_directory(parent_entry)
+            parent_entry = self.state.get_entry(parent_path)
+        if not parent_entry or not parent_entry["remote_drivewsid"]:
+            return None
+        return self._node_from_entry(parent_entry)
+
+    def _refresh_child_meta(self, parent_path, child_name):
+        parent = self._remote_node_for_path(parent_path)
+        if parent is None:
+            raise RuntimeError(f"Missing remote parent: {parent_path}")
+        for child in parent.get_children(force=True):
+            if child.name == child_name:
+                return self._node_to_meta(
+                    child,
+                    "/" + child.name if parent_path == "/" else parent_path.rstrip("/") + "/" + child.name,
+                )
+        raise KeyError(f"Missing child {child_name} under {parent_path}")
+
+    def _remote_node_for_path(self, path):
+        if path == "/" or path == "":
+            return self.api.drive.root
+        entry = self.state.get_entry(path)
+        if not entry or not entry["remote_drivewsid"]:
+            return None
+        return self._node_from_entry(entry)
+
+    def _refresh_node_by_id(self, remote_drivewsid):
+        data = self.api.drive.get_node_data(remote_drivewsid)
+        return DriveNode(self.api.drive, data)
+
+    def _node_from_entry(self, entry):
+        return self._refresh_node_by_id(entry["remote_drivewsid"])
+
+    def _node_to_meta(self, node, path):
+        data = node.data
+        node_type = data.get("type", "FILE").lower()
+        if node_type == "folder":
+            size = 0
+        else:
+            size = int(data.get("size", 0) or 0)
+        return {
+            "path": path,
+            "type": node_type,
+            "parent_path": os.path.dirname(path) or "/",
+            "remote_drivewsid": data.get("drivewsid"),
+            "remote_docwsid": data.get("docwsid"),
+            "remote_etag": data.get("etag"),
+            "remote_zone": data.get("zone"),
+            "size": size,
+            "mtime": parse_remote_time(data.get("dateModified")),
+        }
+
+    def _entry_conflicts(self, entry, meta):
+        return (
+            (entry.get("synced_path") and entry["synced_path"] != meta["path"])
+            or (entry.get("remote_etag") and entry["remote_etag"] != meta["remote_etag"])
+        )
+
+    def _conflict_path(self, path):
+        dirname = os.path.dirname(path) or "/"
+        basename = os.path.basename(path)
+        stamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        return (
+            "/" + f"{basename}.local-conflict-{stamp}"
+            if dirname == "/"
+            else dirname.rstrip("/") + "/" + f"{basename}.local-conflict-{stamp}"
+        )
+
+    def _path_lock(self, path):
+        with self.path_locks_lock:
+            lock = self.path_locks.get(path)
+            if lock is None:
+                lock = threading.Lock()
+                self.path_locks[path] = lock
+            return lock
+
+
+class ICloudFS(Fuse):
     def __init__(self, *args, **kw):
-        """Initialize the filesystem"""
         super(ICloudFS, self).__init__(*args, **kw)
-
         self.logger = logging.getLogger("icloud")
-        self.logger.info("Initializing iCloud FUSE filesystem")
-
-        # These will be set in the main function after parsing config
         self.username = None
         self.password = None
         self.cache_dir = None
         self.api = None
-
-        # Content cache: path -> (content, timestamp)
-        self.content_cache = {}
-        # Tracks files modified locally and pending upload
-        self.dirty_paths = set()
-
-        # File attributes cache: path -> (attrs, timestamp)
-        self.attr_cache = {}
-
-        # Directory listing cache: path -> (entries, timestamp)
-        self.dir_cache = {}
-
-        # Cache expiration time (seconds)
-        self.cache_timeout = 300  # 5 minutes
-
-        # Lock for cache access
-        self.cache_lock = threading.RLock()
-
-        self.fd = 0
-        self.fd_lock = threading.Lock()
-        self.fd_map = {}  # Maps file descriptors to file paths
+        self.mirror = None
+        self.state = None
+        self.sync_engine = None
 
     def init_icloud(self, username, password, cache_dir, cookie_dir=None):
-        """Initialize iCloud connection"""
         self.username = username
         self.password = password
         self.cache_dir = cache_dir
-
         os.makedirs(self.cache_dir, exist_ok=True)
         if cookie_dir:
             os.makedirs(cookie_dir, exist_ok=True)
 
         try:
             self.api = PyiCloudService(username, password, cookie_directory=cookie_dir)
-
-            # Never block a systemd service waiting for stdin.
             if self.api.requires_2fa:
                 if sys.stdin.isatty():
                     print("Two-factor authentication required.")
                     code = input("Enter the verification code: ").strip()
                     result = self.api.validate_2fa_code(code)
                     print("Result: %s" % result)
-                    if result:
-                        if not self.api.is_trusted_session:
-                            self.api.trust_session()
+                    if result and not self.api.is_trusted_session:
+                        self.api.trust_session()
                 else:
                     raise RuntimeError(
                         "2FA required, but no interactive terminal is available. "
@@ -111,11 +1257,11 @@ class ICloudFS(fuse.Fuse):
                 if sys.stdin.isatty():
                     print("Two-step authentication required.")
                     devices = self.api.trusted_devices
-                    for i, device in enumerate(devices):
-                        label = device.get('deviceName') or f"SMS to {device.get('phoneNumber', 'unknown')}"
-                        print(f"{i}: {label}")
-                    idx = int(input("Select device index: ").strip() or "0")
-                    device = devices[idx]
+                    for index, device in enumerate(devices):
+                        label = device.get("deviceName") or f"SMS to {device.get('phoneNumber', 'unknown')}"
+                        print(f"{index}: {label}")
+                    selected = int(input("Select device index: ").strip() or "0")
+                    device = devices[selected]
                     self.api.send_verification_code(device)
                     code = input("Enter the verification code: ").strip()
                     if not self.api.validate_verification_code(device, code):
@@ -128,572 +1274,359 @@ class ICloudFS(fuse.Fuse):
 
             if self.api.requires_2fa or self.api.requires_2sa:
                 raise RuntimeError("Additional authentication still required after code verification.")
-
-        except Exception as e:
-            self.logger.error(f"Failed to connect to iCloud: {str(e)}")
+        except Exception as exc:
+            self.logger.error("Failed to connect to iCloud: %s", exc)
             raise
 
-    def _get_next_fd(self):
-        """Get the next available file descriptor"""
-        with self.fd_lock:
-            fd = self.fd
-            self.fd += 1
-            return fd
-
-    def _get_drive_item(self, path):
-        """Get an item from iCloud Drive by path"""
-        if path == "/" or path == "":
-            return self.api.drive
-
-        self.logger.debug("Getting drive item from path: " + str(path))
-        components = path.strip("/").split("/")
-        self.logger.debug("Components: " + str(components))
-
-        try:
-            search_window = self.api.drive
-            for i, component in enumerate(components):
-                if i == len(components) - 1:
-                    break
-                search_window = search_window[component]
-            item = search_window[components[-1]]
-            self.logger.debug("Successfully found and returning drive item")
-            return item
-        except Exception as e:
-            self.logger.error(f"Error finding drive item at {path}: {str(e)}")
-            return None
-
-    def _get_path_type(self, path):
-        """Determine if a path is a file or directory"""
-        item = self._get_drive_item(path)
-        # self.logger.debug("Getting path type from item obj: " + jsonpickle.encode(item))
-        if item is None:
-            return None
-        if "type" in item.data:
-            self.logger.debug("Item type: " + item.data["type"])
-            return item.data["type"]
-        # Default to folder if type attribute is missing
-        defaulted_type = "FOLDER" if hasattr(item, "dir") else "FILE"
-        self.logger.debug("Defaulted type: " + defaulted_type)
-        return defaulted_type
+    def init_local_cache(
+        self,
+        cache_dir,
+        warmup_mode,
+        conflict_mode,
+        upload_interval_seconds,
+        remote_refresh_interval_seconds,
+    ):
+        self.mirror = LocalMirror(cache_dir)
+        state_path = os.path.join(cache_dir, "state.sqlite3")
+        self.state = SyncState(state_path)
+        self.sync_engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            self.logger,
+            warmup_mode=warmup_mode,
+            conflict_mode=conflict_mode,
+            upload_interval_seconds=upload_interval_seconds,
+            remote_refresh_interval_seconds=remote_refresh_interval_seconds,
+        )
+        self.sync_engine.start()
 
     def getattr(self, path):
-        """Get file attributes"""
-        with self.cache_lock:
-            # Check cache first
-            if path in self.attr_cache:
-                attrs, timestamp = self.attr_cache[path]
-                if time.time() - timestamp < self.cache_timeout:
-                    self.logger.debug(
-                        "Attributes for path " + str(path) + ": " + str(attrs)
-                    )
-                    return attrs
-
-        self.logger.debug(f"getattr: {path}")
         now = int(time.time())
-
+        entry = self.state.get_entry(path) if self.state else None
         attrs = Stat()
 
         if path == "/":
-            attrs.st_mode = stat.S_IFDIR | 0o755
-            attrs.st_nlink = 2
-            attrs.st_size = 0
-            attrs.st_ctime = now
-            attrs.st_mtime = now
-            attrs.st_atime = now
-            attrs.st_uid = os.getuid()
-            attrs.st_gid = os.getgid()
-
-            with self.cache_lock:
-                self.attr_cache[path] = (attrs, now)
-            self.logger.debug("Path was /")
-            return attrs
-
-        # If file is newly created locally and not uploaded yet, synthesize attrs.
-        with self.cache_lock:
-            if path in self.content_cache:
-                content, _ = self.content_cache[path]
-                attrs.st_mode = stat.S_IFREG | 0o644
-                attrs.st_nlink = 1
-                attrs.st_size = len(content)
+            try:
+                stats = self.mirror.stat_local(path)
+                self._apply_os_stat(attrs, stats)
+            except Exception:
+                attrs.st_mode = stat.S_IFDIR | 0o755
+                attrs.st_nlink = 2
+                attrs.st_size = 0
                 attrs.st_ctime = now
                 attrs.st_mtime = now
                 attrs.st_atime = now
                 attrs.st_uid = os.getuid()
                 attrs.st_gid = os.getgid()
-                self.attr_cache[path] = (attrs, now)
-                return attrs
+            return attrs
 
-        item = self._get_drive_item(path)
-        if item is None:
-            self.logger.error("Item not found")
-            return -errno.ENOENT
+        if self.mirror and self.mirror.exists(path):
+            stats = self.mirror.stat_local(path)
+            self._apply_os_stat(attrs, stats)
+            if entry and entry["type"] == "file" and not entry["hydrated"]:
+                attrs.st_size = entry["size"]
+                attrs.st_mtime = entry["mtime"]
+                attrs.st_ctime = entry["mtime"]
+            return attrs
 
-        item_type = self._get_path_type(path)
-
-        if item_type == "FOLDER":
-            self.logger.debug("Item is folder")
-            attrs.st_mode = stat.S_IFDIR | 0o755
-            attrs.st_nlink = 3
-            attrs.st_size = 0
-            attrs.st_ctime = now
-            attrs.st_mtime = now
+        if entry and not entry["tombstone"]:
+            attrs.st_mode = (stat.S_IFDIR | 0o755) if entry["type"] == "folder" else (stat.S_IFREG | 0o644)
+            attrs.st_nlink = 2 if entry["type"] == "folder" else 1
+            attrs.st_size = entry["size"]
+            attrs.st_ctime = entry["mtime"] or now
+            attrs.st_mtime = entry["mtime"] or now
             attrs.st_atime = now
             attrs.st_uid = os.getuid()
             attrs.st_gid = os.getgid()
-        else:
-            self.logger.debug("Item is not a folder")
-            size = item.data["size"] if "size" in item.data else 4096
-            modified = (
-                item.data["dateModified"] if "dateModified" in item.data else None
-            )
-            if modified:
-                parsing = datetime.datetime.strptime(modified, "%Y-%m-%dT%H:%M:%SZ")
-                mtime = time.mktime(parsing.timetuple())
-            else:
-                mtime = now
-            mtime = int(mtime)
+            return attrs
 
-            attrs.st_mode = stat.S_IFREG | 0o644
-            attrs.st_nlink = 1
-            attrs.st_size = size
-            attrs.st_ctime = mtime
-            attrs.st_mtime = mtime
-            attrs.st_atime = now
-            attrs.st_uid = os.getuid()
-            attrs.st_gid = os.getgid()
-
-        with self.cache_lock:
-            self.attr_cache[path] = (attrs, now)
-
-        self.logger.debug("Final attributes: " + str(attrs))
-        return attrs
+        return -errno.ENOENT
 
     def readdir(self, path, offset):
-        """Read directory entries"""
-        self.logger.debug(f"readdir: {path}, offset: {offset}")
-
-        entries = [".", ".."]
-        with self.cache_lock:
-            # Check cache first
-            if path in self.dir_cache:
-                self.logger.debug("readdir: in cache")
-                entries_stored, timestamp = self.dir_cache[path]
-                if time.time() - timestamp < self.cache_timeout:
-                    entries = entries_stored
-
-        if len(entries) <= 2:  # Not in cache or cache has just . and ..
-            self.logger.debug("readdir: not in cache")
-            try:
-                item = self._get_drive_item(path)
-                if item is None:
-                    return -errno.ENOENT
-
-                if hasattr(item, "dir"):
-                    # List directory contents
-                    for child in item.dir():
-                        entries.append(child)
-                else:
-                    return -errno.ENOTDIR
-
-                # Include locally-created (not-yet-uploaded) files in directory listing.
-                with self.cache_lock:
-                    prefix = path.rstrip("/") + "/" if path != "/" else "/"
-                    for cached_path in self.content_cache.keys():
-                        if cached_path.startswith(prefix):
-                            rel = cached_path[len(prefix):]
-                            if rel and "/" not in rel:
-                                entries.append(rel)
-
-                    entries = list(dict.fromkeys(entries))
-                    self.dir_cache[path] = (entries, time.time())
-            except Exception as e:
-                self.logger.error(f"Error listing directory {path}: {str(e)}")
-                return -errno.EIO
-
-        # Yield each entry
-        for e in entries:
-            yield fuse.Direntry(e)
-
-    def open(self, path, flags):
-        """Open a file (does not return file descriptor, just checks for errors)"""
-        self.logger.debug(f"open: {path}, flags: {flags}")
-
-        with self.cache_lock:
-            if path in self.content_cache:
-                return 0
-
-        item = self._get_drive_item(path)
-        if item is None:
-            # Allow create/append/truncate style opens to proceed for new files.
-            if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
-                with self.cache_lock:
-                    if path not in self.content_cache:
-                        self.content_cache[path] = (b"", time.time())
-                return 0
-
-            self.logger.error(f"File not found: {path}")
+        if not self.mirror.exists(path) or not self.mirror.is_dir(path):
             return -errno.ENOENT
 
+        entries = [".", ".."] + sorted(self.mirror.listdir(path))
+        for entry in entries:
+            yield fuse.Direntry(entry)
+
+    def open(self, path, flags):
+        if not self.state.get_entry(path):
+            if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
+                self.create(path, 0o644, flags)
+                return 0
+            return -errno.ENOENT
+
+        entry = self.state.get_entry(path)
+        if entry and entry["type"] == "file" and not entry["hydrated"] and not entry["dirty"]:
+            try:
+                self.sync_engine.ensure_local_file(path)
+            except Exception as exc:
+                self.logger.error("Failed hydrating on open for %s: %s", path, exc)
+                return -errno.EIO
         return 0
 
     def create(self, path, mode, flags=None):
-        """Create a new file"""
-        self.logger.debug(f"create: {path}, mode: {mode}, flags: {flags}")
-        with self.cache_lock:
-            self.content_cache[path] = (b"", time.time())
-            self.dirty_paths.add(path)
-        return 0
+        try:
+            self.mirror.create_file(path)
+            stats = self.mirror.stat_local(path)
+            self.state.upsert_entry(
+                {
+                    "path": path,
+                    "type": "file",
+                    "parent_path": os.path.dirname(path) or "/",
+                    "size": 0,
+                    "mtime": int(stats.st_mtime),
+                    "hydrated": True,
+                    "dirty": True,
+                    "tombstone": False,
+                    "synced_path": None,
+                }
+            )
+            self.state.queue_op("create", path)
+            return 0
+        except Exception as exc:
+            self.logger.error("Error creating file %s: %s", path, exc)
+            return -errno.EIO
 
     def read(self, path, size, offset):
-        """Read data from a file"""
-        self.logger.debug(f"read: {path}, size: {size}, offset: {offset}")
-
-        content = None
-        with self.cache_lock:
-            # Check if we have cached content
-            if path in self.content_cache:
-                content, timestamp = self.content_cache[path]
-                if time.time() - timestamp < self.cache_timeout:
-                    return content[offset : offset + size]
+        entry = self.state.get_entry(path)
+        if not entry or entry["type"] != "file" or entry["tombstone"]:
+            return -errno.ENOENT
 
         try:
-            if content is None:
-                item = self._get_drive_item(path)
-                if item is None:
-                    return -errno.ENOENT
-
-                # Download the file from iCloud
-                content = item.open(stream=True).raw.read()
-
-                with self.cache_lock:
-                    self.content_cache[path] = (content, time.time())
-
-            return content[offset : offset + size]
-        except Exception as e:
-            self.logger.error(f"Error reading file {path}: {str(e)}")
+            if not entry["hydrated"] and not entry["dirty"]:
+                self.sync_engine.ensure_local_file(path)
+            return self.mirror.read(path, size, offset)
+        except Exception as exc:
+            self.logger.error("Error reading %s: %s", path, exc)
             return -errno.EIO
 
     def write(self, path, buf, offset):
-        """Write data to a file"""
-        self.logger.debug(f"write: {path}, offset: {offset}, size: {len(buf)}")
+        entry = self.state.get_entry(path)
+        if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
+            try:
+                self.sync_engine.ensure_local_file(path)
+            except Exception as exc:
+                self.logger.error("Failed hydrating before write %s: %s", path, exc)
+                return -errno.EIO
 
         try:
-            # Cache the data for later upload on flush/release
-            with self.cache_lock:
-                if path in self.content_cache:
-                    content, _ = self.content_cache[path]
-                    if offset == 0:
-                        new_content = buf
-                    elif offset < len(content):
-                        new_content = content[:offset] + buf
-                    else:
-                        # Handle case where offset > len(content)
-                        new_content = content + b"\0" * (offset - len(content)) + buf
-                else:
-                    if offset > 0:
-                        new_content = b"\0" * offset + buf
-                    else:
-                        new_content = buf
-
-                self.content_cache[path] = (new_content, time.time())
-                self.dirty_paths.add(path)
-
-            return len(buf)
-        except Exception as e:
-            self.logger.error(f"Error writing to file {path}: {str(e)}")
+            written = self.mirror.write(path, buf, offset)
+            stats = self.mirror.stat_local(path)
+            checksum = self.mirror.file_sha256(path)
+            if not entry:
+                self.state.upsert_entry(
+                    {
+                        "path": path,
+                        "type": "file",
+                        "parent_path": os.path.dirname(path) or "/",
+                        "size": stats.st_size,
+                        "mtime": int(stats.st_mtime),
+                        "hydrated": True,
+                        "dirty": True,
+                        "tombstone": False,
+                        "local_sha256": checksum,
+                        "synced_path": None,
+                    }
+                )
+            else:
+                self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
+            self.state.queue_op("update", path)
+            return written
+        except Exception as exc:
+            self.logger.error("Error writing %s: %s", path, exc)
             return -errno.EIO
 
     def flush(self, path):
-        """Flush cached data to iCloud (called on close)"""
-        self.logger.debug(f"flush: {path}")
-        return 0  # We'll actually upload in release()
+        return 0
 
     def release(self, path, flags):
-        """Release a file (close it)"""
-        self.logger.debug(f"release: {path}")
-
-        try:
-            with self.cache_lock:
-                if path in self.content_cache and path in self.dirty_paths:
-                    content, timestamp = self.content_cache[path]
-
-                    parent_path = os.path.dirname(path)
-                    filename = os.path.basename(path)
-
-                    parent = self._get_drive_item(parent_path)
-                    if parent is None:
-                        return -errno.ENOENT
-
-                    # Replace existing file when overwriting
-                    existing = self._get_drive_item(path)
-                    if existing is not None:
-                        try:
-                            existing.delete()
-                        except Exception:
-                            pass
-
-                    # pyicloud expects file-like objects with a .name
-                    file_obj = BytesIO(content)
-                    file_obj.name = filename
-                    parent.upload(file_obj)
-
-                    # Mark sync complete for this path
-                    self.dirty_paths.discard(path)
-
-                    # Invalidate caches for this path and parent directory listing
-                    if path in self.attr_cache:
-                        del self.attr_cache[path]
-                    if parent_path in self.dir_cache:
-                        del self.dir_cache[parent_path]
-
-            # Clean up file descriptor
-            for fd, p in list(self.fd_map.items()):
-                if p == path:
-                    del self.fd_map[fd]
-
-            return 0
-        except Exception as e:
-            self.logger.error(f"Error releasing file {path}: {str(e)}")
-            return -errno.EIO
+        return 0
 
     def mkdir(self, path, mode):
-        """Create a directory"""
-        self.logger.debug(f"mkdir: {path}, mode: {mode}")
-
         try:
-            parent_path = os.path.dirname(path)
-            dirname = os.path.basename(path)
-
-            parent = self._get_drive_item(parent_path)
-            if parent is None:
-                return -errno.ENOENT
-
-            # Create directory in iCloud
-            parent.mkdir(dirname)
-
-            # Invalidate parent directory cache
-            with self.cache_lock:
-                if parent_path in self.dir_cache:
-                    del self.dir_cache[parent_path]
-
-            return 0
-        except Exception as e:
-            raise e
-            self.logger.error(
-                f"Error creating directory {path}: {str(type(e))} {str(e)}"
+            self.mirror.ensure_dir(path)
+            stats = self.mirror.stat_local(path)
+            self.state.upsert_entry(
+                {
+                    "path": path,
+                    "type": "folder",
+                    "parent_path": os.path.dirname(path) or "/",
+                    "size": 0,
+                    "mtime": int(stats.st_mtime),
+                    "hydrated": True,
+                    "dirty": True,
+                    "tombstone": False,
+                    "synced_path": None,
+                }
             )
+            self.state.queue_op("mkdir", path)
+            return 0
+        except Exception as exc:
+            self.logger.error("Error creating directory %s: %s", path, exc)
             return -errno.EIO
 
     def rmdir(self, path):
-        """Remove a directory"""
-        self.logger.debug(f"rmdir: {path}")
+        entry = self.state.get_entry(path)
+        if not entry:
+            return -errno.ENOENT
 
         try:
-            item = self._get_drive_item(path)
-            if item is None:
-                return -errno.ENOENT
-
-            # Check if directory is empty
-            contents = item.dir()
-            if len(contents) > 0:
-                return -errno.ENOTEMPTY
-
-            # Delete the directory
-            item.delete()
-
-            # Invalidate caches
-            parent_path = os.path.dirname(path)
-            with self.cache_lock:
-                if path in self.dir_cache:
-                    del self.dir_cache[path]
-                if path in self.attr_cache:
-                    del self.attr_cache[path]
-                if parent_path in self.dir_cache:
-                    del self.dir_cache[parent_path]
-
+            self.mirror.remove_dir(path)
+            if entry["remote_drivewsid"]:
+                self.state.mark_tombstone(path)
+                self.state.queue_op("delete", path)
+            else:
+                self.state.remove_subtree(path)
             return 0
-        except Exception as e:
-            self.logger.error(f"Error removing directory {path}: {str(e)}")
+        except OSError as exc:
+            if exc.errno:
+                return -exc.errno
+            self.logger.error("Error removing directory %s: %s", path, exc)
             return -errno.EIO
 
     def unlink(self, path):
-        """Remove a file"""
-        self.logger.debug(f"unlink: {path}")
+        entry = self.state.get_entry(path)
+        if not entry:
+            return -errno.ENOENT
 
         try:
-            item = self._get_drive_item(path)
-            if item is None:
-                return -errno.ENOENT
-
-            # Delete the file
-            item.delete()
-
-            # Invalidate caches
-            parent_path = os.path.dirname(path)
-            with self.cache_lock:
-                if path in self.content_cache:
-                    del self.content_cache[path]
-                if path in self.attr_cache:
-                    del self.attr_cache[path]
-                if parent_path in self.dir_cache:
-                    del self.dir_cache[parent_path]
-
+            if self.mirror.exists(path):
+                self.mirror.remove_file(path)
+            if entry["remote_drivewsid"]:
+                self.state.mark_tombstone(path)
+                self.state.queue_op("delete", path)
+            else:
+                self.state.remove_entry(path)
             return 0
-        except Exception as e:
-            self.logger.error(f"Error removing file {path}: {str(e)}")
+        except OSError as exc:
+            if exc.errno:
+                return -exc.errno
+            self.logger.error("Error unlinking %s: %s", path, exc)
             return -errno.EIO
 
     def rename(self, oldpath, newpath):
-        """Rename a file or directory"""
-        self.logger.debug(f"rename: {oldpath} -> {newpath}")
+        entry = self.state.get_entry(oldpath)
+        if not entry:
+            return -errno.ENOENT
 
         try:
-            item = self._get_drive_item(oldpath)
-            if item is None:
-                return -errno.ENOENT
-
-            # Get new parent path and name
-            new_parent_path = os.path.dirname(newpath)
-            new_name = os.path.basename(newpath)
-
-            new_parent = self._get_drive_item(new_parent_path)
-            if new_parent is None:
-                return -errno.ENOENT
-
-            # Currently PyiCloud doesn't have a direct rename method
-            # For files, we need to download and re-upload
-            if self._get_path_type(oldpath) == "file":
-                content = item.open(stream=True).raw.read()
-                new_parent.upload(new_name, BytesIO(content))
-                item.delete()
-            else:
-                # For directories, this is more complex and not fully supported
-                return -errno.ENOSYS
-
-            # Invalidate caches
-            old_parent_path = os.path.dirname(oldpath)
-            with self.cache_lock:
-                if oldpath in self.content_cache:
-                    del self.content_cache[oldpath]
-                if oldpath in self.attr_cache:
-                    del self.attr_cache[oldpath]
-                if oldpath in self.dir_cache:
-                    del self.dir_cache[oldpath]
-                if old_parent_path in self.dir_cache:
-                    del self.dir_cache[old_parent_path]
-                if new_parent_path in self.dir_cache:
-                    del self.dir_cache[new_parent_path]
-
+            if self.mirror.exists(newpath):
+                self.mirror.remove_tree(newpath)
+                existing = self.state.get_entry(newpath)
+                if existing:
+                    if existing["remote_drivewsid"]:
+                        self.state.mark_tombstone(newpath)
+                    else:
+                        self.state.remove_subtree(newpath)
+            self.mirror.rename_path(oldpath, newpath)
+            self.state.rename_tree(oldpath, newpath, root_dirty=True)
+            self.state.queue_op("rename", oldpath, newpath)
             return 0
-        except Exception as e:
-            self.logger.error(f"Error renaming {oldpath} to {newpath}: {str(e)}")
+        except Exception as exc:
+            self.logger.error("Error renaming %s to %s: %s", oldpath, newpath, exc)
             return -errno.EIO
 
     def truncate(self, path, length):
-        """Truncate a file to a specified length"""
-        self.logger.debug(f"truncate: {path}, length: {length}")
+        entry = self.state.get_entry(path)
+        if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
+            try:
+                self.sync_engine.ensure_local_file(path)
+            except Exception as exc:
+                self.logger.error("Failed hydrating before truncate %s: %s", path, exc)
+                return -errno.EIO
 
         try:
-            with self.cache_lock:
-                if path in self.content_cache:
-                    content, timestamp = self.content_cache[path]
-                    if length < len(content):
-                        self.content_cache[path] = (content[:length], time.time())
-                    else:
-                        # Pad with zeros if truncating to larger size
-                        self.content_cache[path] = (
-                            content + b"\0" * (length - len(content)),
-                            time.time(),
-                        )
-                else:
-                    # If we don't have cached content, we need to download first
-                    item = self._get_drive_item(path)
-                    if item is None:
-                        return -errno.ENOENT
-                    content = item.open(stream=True).raw.read()
-                    if length < len(content):
-                        self.content_cache[path] = (content[:length], time.time())
-                    else:
-                        # Pad with zeros if truncating to larger size
-                        self.content_cache[path] = (
-                            content + b"\0" * (length - len(content)),
-                            time.time(),
-                        )
-
-                self.dirty_paths.add(path)
-
+            self.mirror.truncate(path, length)
+            stats = self.mirror.stat_local(path)
+            checksum = self.mirror.file_sha256(path)
+            if not entry:
+                self.state.upsert_entry(
+                    {
+                        "path": path,
+                        "type": "file",
+                        "parent_path": os.path.dirname(path) or "/",
+                        "size": stats.st_size,
+                        "mtime": int(stats.st_mtime),
+                        "hydrated": True,
+                        "dirty": True,
+                        "tombstone": False,
+                        "local_sha256": checksum,
+                        "synced_path": None,
+                    }
+                )
+            else:
+                self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
+            self.state.queue_op("update", path)
             return 0
-        except Exception as e:
-            self.logger.error(f"Error truncating file {path}: {str(e)}")
+        except Exception as exc:
+            self.logger.error("Error truncating %s: %s", path, exc)
             return -errno.EIO
 
     def mknod(self, path, mode, dev):
-        """Create a file node"""
-        self.logger.debug(f"mknod: {path}, mode: {mode}")
-
-        # Only support regular files
         if not stat.S_ISREG(mode):
             return -errno.ENOSYS
-
-        # Initialize with empty content
-        with self.cache_lock:
-            self.content_cache[path] = (b"", time.time())
-            self.dirty_paths.add(path)
-
-        return 0
+        return self.create(path, mode)
 
     def utime(self, path, times):
-        """Set file times - not supported by iCloud API"""
-        self.logger.debug(f"utime: {path}")
-        # We just pretend this worked since we can't actually set times in iCloud
-        return 0
+        try:
+            if not self.mirror.exists(path):
+                return -errno.ENOENT
+            atime, mtime = times if times else (time.time(), time.time())
+            self.mirror.set_mtime(path, int(mtime))
+            stats = self.mirror.stat_local(path)
+            if self.state.get_entry(path):
+                self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime))
+            return 0
+        except Exception as exc:
+            self.logger.error("Error setting utime for %s: %s", path, exc)
+            return -errno.EIO
 
     def statfs(self):
-        """Get filesystem stats"""
-        self.logger.debug("statfs")
-
-        # Default values since iCloud doesn't provide this info
-        block_size = 4096
-        blocks = 1000000  # Just a large number
-        blocks_free = 800000  # 80% free
-
+        stats = self.mirror.statvfs()
         return {
-            "f_bsize": block_size,
-            "f_frsize": block_size,
-            "f_blocks": blocks,
-            "f_bfree": blocks_free,
-            "f_bavail": blocks_free,
-            "f_files": 1000000,  # inodes
-            "f_ffree": 800000,  # free inodes
-            "f_namelen": 255,  # max filename length
+            "f_bsize": stats.f_bsize,
+            "f_frsize": stats.f_frsize,
+            "f_blocks": stats.f_blocks,
+            "f_bfree": stats.f_bfree,
+            "f_bavail": stats.f_bavail,
+            "f_files": stats.f_files,
+            "f_ffree": stats.f_ffree,
+            "f_namelen": stats.f_namemax,
         }
+
+    def _apply_os_stat(self, attrs, stats):
+        attrs.st_mode = stats.st_mode
+        attrs.st_ino = stats.st_ino
+        attrs.st_dev = stats.st_dev
+        attrs.st_nlink = stats.st_nlink
+        attrs.st_uid = stats.st_uid
+        attrs.st_gid = stats.st_gid
+        attrs.st_size = stats.st_size
+        attrs.st_atime = int(stats.st_atime)
+        attrs.st_mtime = int(stats.st_mtime)
+        attrs.st_ctime = int(stats.st_ctime)
 
 
 def parse_config(config_path):
-    """Parse the configuration file"""
     try:
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
         return config
-    except Exception as e:
-        print(f"Error parsing config file: {str(e)}")
+    except Exception as exc:
+        print(f"Error parsing config file: {exc}")
         sys.exit(1)
 
 
 def main():
-    # Set up argument parser
     usage = """
 iCloud Linux: Mount iCloud Drive as a FUSE filesystem
-    
+
 %prog [options] mountpoint
 """
-
-    # Create a new Fuse instance
-    fs = ICloudFS(
-        version="%prog " + fuse.__version__, usage=usage, dash_s_do="setsingle"
-    )
-
-    # Define command line options
+    fs = ICloudFS(version="%prog " + fuse.__version__, usage=usage, dash_s_do="setsingle")
     fs.parser.add_option(
         "-c",
         "--config",
@@ -701,15 +1634,10 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         default=os.path.expanduser("~/.config/icloud-linux/config.yaml"),
         help="Path to config file (default: ~/.config/icloud-linux/config.yaml)",
     )
-    fs.parser.add_option(
-        "-v", "--debug", dest="debug", action="store_true", help="Enable debug logging"
-    )
-
-    # Parse command line
+    fs.parser.add_option("-v", "--debug", dest="debug", action="store_true", help="Enable debug logging")
     fs.parse(errex=1)
     args = fs.cmdline[0]
 
-    # Configure logging
     log_level = logging.DEBUG if args.debug else logging.INFO
     log_path = os.environ.get("ICLOUD_LOG_PATH", os.path.expanduser("~/.local/state/icloud-linux/icloud.log"))
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -721,25 +1649,28 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     )
     logger = logging.getLogger("icloud")
 
-    # Parse configuration
     config = parse_config(args.config)
-
-    # Get username and password from config
     username = config.get("username")
     password = config.get("password")
-
     if not username or not password:
         logger.error("Username or password not provided in config file")
         sys.exit(1)
 
-    # Set up cache and cookie directories
-    cache_dir = config.get("cache_dir", os.path.expanduser("~/.cache/icloud-linux"))
-    cookie_dir = config.get("cookie_dir", os.path.expanduser("~/.config/icloud-linux/cookies"))
+    cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/icloud-linux"))
+    cookie_dir = os.path.expanduser(config.get("cookie_dir", "~/.config/icloud-linux/cookies"))
+    warmup_mode = config.get("warmup_mode", "background")
+    conflict_mode = config.get("conflict_mode", "copy")
+    upload_interval_seconds = int(config.get("upload_interval_seconds", 30))
+    remote_refresh_interval_seconds = int(config.get("remote_refresh_interval_seconds", 300))
 
-    # Initialize iCloud connection
     fs.init_icloud(username, password, cache_dir, cookie_dir)
-
-    # Start FUSE
+    fs.init_local_cache(
+        cache_dir,
+        warmup_mode,
+        conflict_mode,
+        upload_interval_seconds,
+        remote_refresh_interval_seconds,
+    )
     fs.main()
 
 

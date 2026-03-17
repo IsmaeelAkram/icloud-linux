@@ -8,6 +8,20 @@ password: "your_apple_id_password"
 # Cache directory
 cache_dir: "~/.cache/icloud-linux"
 
+# Cache warmup mode. "background" mounts after metadata sync and hydrates file contents
+# in the background. "lazy" downloads file contents only when first opened.
+warmup_mode: "background"
+
+# Conflict handling. "copy" preserves the local version as
+# "<name>.local-conflict-<timestamp>" if the same path changed remotely.
+conflict_mode: "copy"
+
+# Push local changes to iCloud every N seconds.
+upload_interval_seconds: 30
+
+# Refresh remote metadata from iCloud every N seconds.
+remote_refresh_interval_seconds: 300
+
 # Persistent cookie/session directory used after one-time 2FA bootstrap
 cookie_dir: "~/.config/icloud-linux/cookies"
 
