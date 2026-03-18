@@ -697,6 +697,13 @@ class ICloudSyncEngine:
         # PyiCloud downloads appear sensitive to concurrent use of one session.
         self.download_semaphore = threading.Semaphore(1)
 
+    def _log_sync(self, event, level=logging.INFO, **fields):
+        details = " ".join(f"{key}={value!r}" for key, value in fields.items() if value is not None)
+        if details:
+            self.logger.log(level, "sync %s %s", event, details)
+            return
+        self.logger.log(level, "sync %s", event)
+
     def start(self):
         if self.has_persistent_cache():
             self.logger.info("Using persistent local cache from %s", self.mirror.root)
@@ -816,13 +823,28 @@ class ICloudSyncEngine:
             if entry["hydrated"] and self.mirror.exists(path):
                 return
             if not entry["remote_drivewsid"]:
+                self._log_sync("hydrate-local", level=logging.DEBUG, path=path)
                 if not self.mirror.exists(path):
                     self.mirror.create_file(path)
                 checksum = self.mirror.file_sha256(path)
                 stats = self.mirror.stat_local(path)
                 self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
+                self._log_sync(
+                    "hydrate-complete",
+                    level=logging.INFO,
+                    path=path,
+                    source="local",
+                    size=stats.st_size,
+                )
                 return
 
+            self._log_sync(
+                "hydrate-start",
+                level=logging.INFO,
+                path=path,
+                drivewsid=entry.get("remote_drivewsid"),
+                size=entry.get("size"),
+            )
             self.logger.debug("Hydrating %s", path)
             with self.download_semaphore:
                 self.logger.debug(
@@ -839,6 +861,7 @@ class ICloudSyncEngine:
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
             self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
+            self._log_sync("hydrate-complete", level=logging.INFO, path=path, source="remote", size=stats.st_size)
 
     def _crawl_remote_snapshot(self):
         self.logger.info("Starting remote metadata crawl")
@@ -919,6 +942,13 @@ class ICloudSyncEngine:
 
     def _materialize_remote_entry(self, meta):
         local_path = meta["path"]
+        self._log_sync(
+            "remote-materialize",
+            path=local_path,
+            entry_type=meta["type"],
+            drivewsid=meta.get("remote_drivewsid"),
+            size=meta.get("size"),
+        )
         if meta["type"] == "folder":
             self.mirror.ensure_dir(local_path)
             hydrated = True
@@ -941,10 +971,12 @@ class ICloudSyncEngine:
         oldpath = entry["path"]
         newpath = meta["path"]
         if oldpath != newpath and self.mirror.exists(oldpath):
+            self._log_sync("remote-rename", path=oldpath, target_path=newpath, entry_type=meta["type"])
             self.mirror.rename_path(oldpath, newpath)
             self.state.rename_tree(oldpath, newpath, root_dirty=False, update_synced=True)
             entry = self.state.get_entry(newpath)
         elif oldpath != newpath:
+            self._log_sync("remote-rename", path=oldpath, target_path=newpath, entry_type=meta["type"])
             self.state.rename_tree(oldpath, newpath, root_dirty=False, update_synced=True)
             entry = self.state.get_entry(newpath)
 
@@ -971,6 +1003,13 @@ class ICloudSyncEngine:
         )
         hydrated = bool(entry and entry["hydrated"] and not should_replace)
         if should_replace:
+            self._log_sync(
+                "remote-update",
+                path=newpath,
+                old_etag=entry.get("remote_etag") if entry else None,
+                new_etag=meta.get("remote_etag"),
+                size=meta.get("size"),
+            )
             self.mirror.materialize_placeholder(newpath, meta["size"], meta["mtime"])
             hydrated = meta["size"] == 0
         self.state.upsert_entry(
@@ -1024,6 +1063,13 @@ class ICloudSyncEngine:
                 return
             self.scheduled_downloads.add(path)
 
+        self._log_sync(
+            "download-scheduled",
+            level=logging.DEBUG if delay_seconds <= 0 else logging.INFO,
+            path=path,
+            delay_seconds=delay_seconds,
+        )
+
         if delay_seconds <= 0:
             try:
                 self.executor.submit(self._download_job, path)
@@ -1073,6 +1119,7 @@ class ICloudSyncEngine:
             self.ensure_local_file(path)
             with self.downloads_lock:
                 self.download_retry_attempts.pop(path, None)
+            self._log_sync("download-complete", level=logging.INFO, path=path)
             with self.hydration_progress_lock:
                 self.hydration_completed += 1
                 completed = self.hydration_completed
@@ -1140,6 +1187,8 @@ class ICloudSyncEngine:
         if not dirty_entries:
             return
 
+        self._log_sync("dirty-scan", dirty_count=len(dirty_entries))
+
         tombstones = sorted(
             [entry for entry in dirty_entries if entry["tombstone"]],
             key=lambda entry: (entry["path"].count("/"), entry["path"]),
@@ -1163,6 +1212,7 @@ class ICloudSyncEngine:
                 self._sync_file(fresh)
 
     def _sync_tombstone(self, entry):
+        self._log_sync("delete-start", path=entry["path"], remote=bool(entry["remote_drivewsid"]))
         if entry["remote_drivewsid"]:
             try:
                 node = self._node_from_entry(entry)
@@ -1171,6 +1221,7 @@ class ICloudSyncEngine:
                 self.logger.error("Failed deleting remote path %s: %s", entry["path"], exc)
                 return
         self.state.remove_subtree(entry["path"])
+        self._log_sync("delete-complete", path=entry["path"])
 
     def _sync_directory(self, entry):
         parent_node = self._ensure_remote_parent(entry["path"])
@@ -1178,15 +1229,23 @@ class ICloudSyncEngine:
             return
 
         try:
+            self._log_sync(
+                "directory-sync-start",
+                path=entry["path"],
+                remote_exists=bool(entry["remote_drivewsid"]),
+                synced_path=entry.get("synced_path"),
+            )
             if not entry["remote_drivewsid"]:
                 parent_node.mkdir(os.path.basename(entry["path"]))
                 meta = self._refresh_child_meta(os.path.dirname(entry["path"]) or "/", os.path.basename(entry["path"]))
                 self.state.mark_clean(entry["path"], meta)
+                self._log_sync("directory-create-complete", path=entry["path"])
                 return
 
             if entry["synced_path"] and entry["synced_path"] != entry["path"]:
                 self._sync_move_or_rename(entry)
             self.state.mark_synced_subtree(entry["path"])
+            self._log_sync("directory-sync-complete", path=entry["path"])
         except Exception as exc:
             self.logger.error("Failed syncing directory %s: %s", entry["path"], exc)
 
@@ -1196,8 +1255,15 @@ class ICloudSyncEngine:
             return
 
         try:
+            self._log_sync(
+                "file-sync-start",
+                path=entry["path"],
+                remote_exists=bool(entry["remote_drivewsid"]),
+                synced_path=entry.get("synced_path"),
+            )
             if not self.mirror.exists(entry["path"]):
                 self.state.mark_tombstone(entry["path"])
+                self._log_sync("file-missing-marked-tombstone", path=entry["path"])
                 return
 
             self.ensure_local_file(entry["path"])
@@ -1220,6 +1286,7 @@ class ICloudSyncEngine:
             meta = self._refresh_child_meta(os.path.dirname(entry["path"]) or "/", os.path.basename(entry["path"]))
             checksum = self.mirror.file_sha256(entry["path"])
             self.state.mark_clean(entry["path"], meta, checksum)
+            self._log_sync("file-sync-complete", path=entry["path"], size=meta.get("size"))
         except Exception as exc:
             self.logger.error("Failed syncing file %s: %s", entry["path"], exc)
 
@@ -1232,6 +1299,7 @@ class ICloudSyncEngine:
         old_name = os.path.basename(synced_path)
         new_name = os.path.basename(entry["path"])
 
+        self._log_sync("move-start", path=synced_path, target_path=entry["path"])
         node = self._node_from_entry(entry)
         if old_parent != new_parent:
             destination = self._remote_node_for_path(new_parent)
@@ -1244,6 +1312,7 @@ class ICloudSyncEngine:
             )
         if old_name != new_name:
             node.rename(new_name)
+        self._log_sync("move-complete", path=synced_path, target_path=entry["path"])
 
     def _ensure_remote_parent(self, path):
         parent_path = os.path.dirname(path) or "/"
@@ -1352,6 +1421,17 @@ class ICloudFS(Fuse):
         self.mirror = None
         self.state = None
         self.sync_engine = None
+
+    def _log_file_op(self, op, path=None, level=logging.INFO, **fields):
+        payload = {}
+        if path is not None:
+            payload["path"] = path
+        payload.update(fields)
+        details = " ".join(f"{key}={value!r}" for key, value in payload.items() if value is not None)
+        if details:
+            self.logger.log(level, "file-op %s %s", op, details)
+            return
+        self.logger.log(level, "file-op %s", op)
 
     def shutdown(self):
         if self.sync_engine is not None:
@@ -1477,11 +1557,13 @@ class ICloudFS(Fuse):
         if not self.mirror.exists(path) or not self.mirror.is_dir(path):
             return -errno.ENOENT
 
+        self._log_file_op("readdir", path, level=logging.DEBUG)
         entries = [".", ".."] + sorted(self.mirror.listdir(path))
         for entry in entries:
             yield fuse.Direntry(entry)
 
     def open(self, path, flags):
+        self._log_file_op("open", path, level=logging.DEBUG, flags=flags)
         if not self.state.get_entry(path):
             if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
                 self.create(path, 0o644, flags)
@@ -1515,6 +1597,7 @@ class ICloudFS(Fuse):
                 }
             )
             self.state.queue_op("create", path)
+            self._log_file_op("create", path, mode=oct(mode), flags=flags)
             return 0
         except Exception as exc:
             self.logger.error("Error creating file %s: %s", path, exc)
@@ -1528,6 +1611,7 @@ class ICloudFS(Fuse):
         try:
             if not entry["hydrated"] and not entry["dirty"]:
                 self.sync_engine.ensure_local_file(path)
+            self._log_file_op("read", path, level=logging.DEBUG, size=size, offset=offset)
             return self.mirror.read(path, size, offset)
         except Exception as exc:
             self.logger.error("Error reading %s: %s", path, exc)
@@ -1564,6 +1648,7 @@ class ICloudFS(Fuse):
             else:
                 self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
             self.state.queue_op("update", path)
+            self._log_file_op("write", path, size=len(buf), offset=offset, written=written)
             return written
         except Exception as exc:
             self.logger.error("Error writing %s: %s", path, exc)
@@ -1593,6 +1678,7 @@ class ICloudFS(Fuse):
                 }
             )
             self.state.queue_op("mkdir", path)
+            self._log_file_op("mkdir", path, mode=oct(mode))
             return 0
         except Exception as exc:
             self.logger.error("Error creating directory %s: %s", path, exc)
@@ -1610,6 +1696,7 @@ class ICloudFS(Fuse):
                 self.state.queue_op("delete", path)
             else:
                 self.state.remove_subtree(path)
+            self._log_file_op("rmdir", path)
             return 0
         except OSError as exc:
             if exc.errno:
@@ -1630,6 +1717,7 @@ class ICloudFS(Fuse):
                 self.state.queue_op("delete", path)
             else:
                 self.state.remove_entry(path)
+            self._log_file_op("unlink", path)
             return 0
         except OSError as exc:
             if exc.errno:
@@ -1654,6 +1742,7 @@ class ICloudFS(Fuse):
             self.mirror.rename_path(oldpath, newpath)
             self.state.rename_tree(oldpath, newpath, root_dirty=True)
             self.state.queue_op("rename", oldpath, newpath)
+            self._log_file_op("rename", oldpath, target_path=newpath)
             return 0
         except Exception as exc:
             self.logger.error("Error renaming %s to %s: %s", oldpath, newpath, exc)
@@ -1690,6 +1779,7 @@ class ICloudFS(Fuse):
             else:
                 self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
             self.state.queue_op("update", path)
+            self._log_file_op("truncate", path, length=length)
             return 0
         except Exception as exc:
             self.logger.error("Error truncating %s: %s", path, exc)
@@ -1709,6 +1799,7 @@ class ICloudFS(Fuse):
             stats = self.mirror.stat_local(path)
             if self.state.get_entry(path):
                 self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime))
+            self._log_file_op("utime", path, atime=int(atime), mtime=int(mtime))
             return 0
         except Exception as exc:
             self.logger.error("Error setting utime for %s: %s", path, exc)
