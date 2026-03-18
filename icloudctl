@@ -43,10 +43,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=-/usr/bin/fusermount -uz $mount_dir
+ExecStop=-/usr/bin/fusermount -uz $mount_dir
 ExecStart=$REPO_DIR/.venv/bin/python $REPO_DIR/driver.py -f -c $CONFIG_FILE $mount_dir
 Restart=on-failure
 RestartSec=15
-KillMode=process
+TimeoutStopSec=10
+KillMode=control-group
+ExecStopPost=-/usr/bin/fusermount -uz $mount_dir
 Environment=ICLOUD_LOG_PATH=%h/.local/state/icloud-linux/icloud.log
 
 [Install]
@@ -62,6 +66,31 @@ ICLOUD_CONFIG=$CONFIG_FILE
 ICLOUD_MOUNT=$mount_dir
 EOF
   chmod 600 "$ENV_FILE"
+}
+
+load_env_if_present() {
+  if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+  fi
+}
+
+cleanup_mountpoint() {
+  load_env_if_present
+  local mount_dir="${1:-${ICLOUD_MOUNT:-$MOUNT_DIR_DEFAULT}}"
+  mkdir -p "$mount_dir"
+
+  if mountpoint -q "$mount_dir"; then
+    echo "Cleaning mounted FUSE endpoint at $mount_dir"
+    fusermount -uz "$mount_dir" >/dev/null 2>&1 || fusermount -u "$mount_dir" >/dev/null 2>&1 || true
+    sleep 1
+  fi
+
+  if [[ -d "$mount_dir" ]] && ! ls "$mount_dir" >/dev/null 2>&1; then
+    echo "Cleaning stale FUSE transport endpoint at $mount_dir"
+    fusermount -uz "$mount_dir" >/dev/null 2>&1 || true
+    sleep 1
+  fi
 }
 
 cmd_init() {
@@ -114,6 +143,7 @@ warmup_mode: "background"
 conflict_mode: "copy"
 upload_interval_seconds: 30
 remote_refresh_interval_seconds: 300
+warmup_workers: 1
 cookie_dir: "$CONFIG_DIR/cookies"
 fuse_options:
   allow_other: false
@@ -130,9 +160,9 @@ cmd_auth() {
   "$REPO_DIR/.venv/bin/python" "$REPO_DIR/auth.py" "$CONFIG_FILE"
 }
 
-cmd_start() { systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
-cmd_stop() { systemctl --user stop icloud.service; }
-cmd_restart() { systemctl --user restart icloud.service; systemctl --user --no-pager status icloud.service; }
+cmd_start() { cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
+cmd_stop() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user --no-pager status icloud.service || true; }
+cmd_restart() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
 cmd_status() { systemctl --user --no-pager status icloud.service; }
 cmd_logs() { journalctl --user -u icloud.service -f; }
 cmd_clear_cache() {

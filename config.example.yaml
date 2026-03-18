@@ -22,6 +22,10 @@ upload_interval_seconds: 30
 # Refresh remote metadata from iCloud every N seconds.
 remote_refresh_interval_seconds: 300
 
+# Number of warmup workers. The default keeps iCloud downloads serialized because
+# parallel reads appear to trigger server-side auth/throttling failures.
+warmup_workers: 1
+
 # Persistent cookie/session directory used after one-time 2FA bootstrap
 cookie_dir: "~/.config/icloud-linux/cookies"
 

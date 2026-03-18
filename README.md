@@ -14,6 +14,7 @@ Mount iCloud Drive on Linux with a local-first FUSE filesystem, persistent disk 
 - **Local-first reads**: once metadata is known, normal filesystem operations are served from the mirror.
 - **Persistent restarts**: after the first initialization crawl, restarts reuse the existing mirror and sync state instead of rebuilding cache from scratch.
 - **Background warmup**: the first initialization does a metadata sync before mount, then hydrates file contents in the background.
+- **Conservative downloads**: warmup downloads are serialized by default because parallel iCloud reads appear to trigger server-side auth/throttling failures.
 - **Real sync engine**: uploads and remote refreshes happen on timers, decoupled from `open`, `read`, `write`, and `readdir`.
 - **Retrying hydrator**: transient iCloud download failures stay queued and are retried with backoff until they succeed.
 - **Conflict preservation**: if local and remote both changed, the local version is kept as a conflict copy instead of being silently lost.

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
+import atexit
 import datetime
 import errno
 import hashlib
+import json
 import logging
 import os
+import signal
 import shutil
 import sqlite3
 import stat
@@ -20,6 +23,13 @@ import fuse
 import yaml
 from fuse import Fuse
 from pyicloud import PyiCloudService
+from pyicloud.exceptions import (
+    PyiCloud2FARequiredException,
+    PyiCloud2SARequiredException,
+    PyiCloudAPIResponseException,
+    PyiCloudAuthRequiredException,
+    PyiCloudFailedLoginException,
+)
 from pyicloud.services.drive import DriveNode
 
 
@@ -44,6 +54,11 @@ class Stat(fuse.Stat):
         self.st_atime = 0
         self.st_mtime = 0
         self.st_ctime = 0
+
+
+class IgnoreIcdrsWarning(logging.Filter):
+    def filter(self, record):
+        return "ICDRS is not disabled; requestWebAccessState=" not in record.getMessage()
 
 
 def parse_remote_time(value):
@@ -93,6 +108,7 @@ class SyncState:
                     remote_docwsid TEXT,
                     remote_etag TEXT,
                     remote_zone TEXT,
+                    remote_shareid TEXT,
                     size INTEGER NOT NULL DEFAULT 0,
                     mtime INTEGER NOT NULL DEFAULT 0,
                     hydrated INTEGER NOT NULL DEFAULT 0,
@@ -117,6 +133,12 @@ class SyncState:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in self.conn.execute("PRAGMA table_info(entries)").fetchall()
+            }
+            if "remote_shareid" not in columns:
+                self.conn.execute("ALTER TABLE entries ADD COLUMN remote_shareid TEXT")
             self.conn.commit()
 
     def upsert_entry(self, entry):
@@ -128,6 +150,7 @@ class SyncState:
             "remote_docwsid": entry.get("remote_docwsid"),
             "remote_etag": entry.get("remote_etag"),
             "remote_zone": entry.get("remote_zone"),
+            "remote_shareid": self._encode_shareid(entry.get("remote_shareid")),
             "size": int(entry.get("size", 0) or 0),
             "mtime": int(entry.get("mtime", 0) or 0),
             "hydrated": int(bool(entry.get("hydrated", False))),
@@ -142,11 +165,11 @@ class SyncState:
                 """
                 INSERT INTO entries (
                     path, type, parent_path, remote_drivewsid, remote_docwsid, remote_etag,
-                    remote_zone, size, mtime, hydrated, dirty, tombstone, local_sha256,
+                    remote_zone, remote_shareid, size, mtime, hydrated, dirty, tombstone, local_sha256,
                     last_synced_at, synced_path
                 ) VALUES (
                     :path, :type, :parent_path, :remote_drivewsid, :remote_docwsid, :remote_etag,
-                    :remote_zone, :size, :mtime, :hydrated, :dirty, :tombstone, :local_sha256,
+                    :remote_zone, :remote_shareid, :size, :mtime, :hydrated, :dirty, :tombstone, :local_sha256,
                     :last_synced_at, :synced_path
                 )
                 ON CONFLICT(path) DO UPDATE SET
@@ -156,6 +179,7 @@ class SyncState:
                     remote_docwsid = excluded.remote_docwsid,
                     remote_etag = excluded.remote_etag,
                     remote_zone = excluded.remote_zone,
+                    remote_shareid = excluded.remote_shareid,
                     size = excluded.size,
                     mtime = excluded.mtime,
                     hydrated = excluded.hydrated,
@@ -175,7 +199,7 @@ class SyncState:
                 "SELECT * FROM entries WHERE path = ?",
                 (path,),
             ).fetchone()
-        return row_to_dict(row)
+        return self._decode_entry(row_to_dict(row))
 
     def get_entry_by_remote_id(self, remote_drivewsid):
         with self.lock:
@@ -183,12 +207,12 @@ class SyncState:
                 "SELECT * FROM entries WHERE remote_drivewsid = ?",
                 (remote_drivewsid,),
             ).fetchone()
-        return row_to_dict(row)
+        return self._decode_entry(row_to_dict(row))
 
     def list_entries(self):
         with self.lock:
             rows = self.conn.execute("SELECT * FROM entries ORDER BY path").fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_entry(dict(row)) for row in rows]
 
     def count_entries(self):
         with self.lock:
@@ -215,7 +239,7 @@ class SyncState:
                 ORDER BY path
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_entry(dict(row)) for row in rows]
 
     def mark_hydrated(self, path, local_sha256=None, size=None, mtime=None):
         with self.lock:
@@ -435,6 +459,7 @@ class SyncState:
                         remote_docwsid = NULL,
                         remote_etag = NULL,
                         remote_zone = NULL,
+                        remote_shareid = NULL,
                         synced_path = NULL,
                         dirty = 1,
                         tombstone = 0
@@ -453,6 +478,7 @@ class SyncState:
                     remote_docwsid = NULL,
                     remote_etag = NULL,
                     remote_zone = NULL,
+                    remote_shareid = NULL,
                     synced_path = NULL,
                     dirty = 1,
                     tombstone = 0
@@ -494,7 +520,23 @@ class SyncState:
                 """,
                 (path, prefix + "%"),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_entry(dict(row)) for row in rows]
+
+    def _encode_shareid(self, shareid):
+        if not shareid:
+            return None
+        return json.dumps(shareid, sort_keys=True)
+
+    def _decode_entry(self, entry):
+        if entry is None:
+            return None
+        shareid = entry.get("remote_shareid")
+        if isinstance(shareid, str) and shareid:
+            try:
+                entry["remote_shareid"] = json.loads(shareid)
+            except json.JSONDecodeError:
+                entry["remote_shareid"] = None
+        return entry
 
 
 class LocalMirror:
@@ -627,7 +669,7 @@ class ICloudSyncEngine:
         conflict_mode="copy",
         upload_interval_seconds=30,
         remote_refresh_interval_seconds=300,
-        warmup_workers=4,
+        warmup_workers=1,
     ):
         self.api = api
         self.mirror = mirror
@@ -637,7 +679,8 @@ class ICloudSyncEngine:
         self.conflict_mode = conflict_mode if conflict_mode in {"copy"} else "copy"
         self.upload_interval_seconds = upload_interval_seconds
         self.remote_refresh_interval_seconds = remote_refresh_interval_seconds
-        self.executor = ThreadPoolExecutor(max_workers=warmup_workers, thread_name_prefix="warmup")
+        self.warmup_workers = max(1, int(warmup_workers))
+        self.executor = ThreadPoolExecutor(max_workers=self.warmup_workers, thread_name_prefix="warmup")
         self.stop_event = threading.Event()
         self.path_locks = {}
         self.path_locks_lock = threading.Lock()
@@ -649,6 +692,10 @@ class ICloudSyncEngine:
         self.hydration_total = 0
         self.hydration_completed = 0
         self.hydration_progress_lock = threading.Lock()
+        self.shutdown_lock = threading.Lock()
+        self.is_shutdown = False
+        # PyiCloud downloads appear sensitive to concurrent use of one session.
+        self.download_semaphore = threading.Semaphore(1)
 
     def start(self):
         if self.has_persistent_cache():
@@ -669,6 +716,25 @@ class ICloudSyncEngine:
         upload_thread.start()
         refresh_thread.start()
         self.threads.extend([upload_thread, refresh_thread])
+
+    def shutdown(self):
+        with self.shutdown_lock:
+            if self.is_shutdown:
+                return
+            self.is_shutdown = True
+            self.stop_event.set()
+            with self.downloads_lock:
+                timers = list(self.download_retry_timers.values())
+                self.download_retry_timers.clear()
+                self.scheduled_downloads.clear()
+            for timer in timers:
+                timer.cancel()
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                self.executor.shutdown(wait=False)
+            for thread in list(self.threads):
+                thread.join(timeout=1)
 
     def has_persistent_cache(self):
         return self.state.count_entries() > 0 and os.path.isdir(self.mirror.root)
@@ -694,13 +760,17 @@ class ICloudSyncEngine:
 
             if self.mirror.exists(path):
                 stats = self.mirror.stat_local(path)
-                checksum = self.mirror.file_sha256(path)
+                checksum = entry.get("local_sha256")
+                hydrated = bool(entry["hydrated"])
+                if entry["type"] == "file" and (hydrated or not entry["remote_drivewsid"]):
+                    checksum = self.mirror.file_sha256(path)
+                    hydrated = True
                 self.state.upsert_entry(
                     {
                         **entry,
                         "size": stats.st_size,
                         "mtime": int(stats.st_mtime),
-                        "hydrated": True,
+                        "hydrated": hydrated,
                         "local_sha256": checksum,
                     }
                 )
@@ -754,8 +824,17 @@ class ICloudSyncEngine:
                 return
 
             self.logger.debug("Hydrating %s", path)
-            node = self._node_from_entry(entry)
-            content = node.open(stream=True).raw.read()
+            with self.download_semaphore:
+                self.logger.debug(
+                    "Hydrating file path=%s drivewsid=%s docwsid=%s zone=%s size=%s",
+                    path,
+                    entry.get("remote_drivewsid"),
+                    entry.get("remote_docwsid"),
+                    entry.get("remote_zone"),
+                    entry.get("size"),
+                )
+                node = self._node_from_entry(entry)
+                content = node.open(stream=True).raw.read()
             self.mirror.write_atomic_bytes(path, content, entry["mtime"])
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
@@ -937,7 +1016,7 @@ class ICloudSyncEngine:
         self._schedule_download_with_delay(path, 0)
 
     def _schedule_download_with_delay(self, path, delay_seconds):
-        if self.stop_event.is_set():
+        if self.stop_event.is_set() or self.is_shutdown:
             return
 
         with self.downloads_lock:
@@ -946,7 +1025,11 @@ class ICloudSyncEngine:
             self.scheduled_downloads.add(path)
 
         if delay_seconds <= 0:
-            self.executor.submit(self._download_job, path)
+            try:
+                self.executor.submit(self._download_job, path)
+            except RuntimeError:
+                with self.downloads_lock:
+                    self.scheduled_downloads.discard(path)
             return
 
         timer = threading.Timer(delay_seconds, self._submit_retry_download, args=(path,))
@@ -958,14 +1041,31 @@ class ICloudSyncEngine:
     def _submit_retry_download(self, path):
         with self.downloads_lock:
             self.download_retry_timers.pop(path, None)
-        if self.stop_event.is_set():
+        if self.stop_event.is_set() or self.is_shutdown:
             with self.downloads_lock:
                 self.scheduled_downloads.discard(path)
             return
-        self.executor.submit(self._download_job, path)
+        try:
+            self.executor.submit(self._download_job, path)
+        except RuntimeError:
+            with self.downloads_lock:
+                self.scheduled_downloads.discard(path)
 
     def _retry_delay_for_attempt(self, attempt):
         return min(300, 5 * (2 ** max(0, attempt - 1)))
+
+    def _is_auth_error(self, exc):
+        if isinstance(
+            exc,
+            (
+                PyiCloud2FARequiredException,
+                PyiCloud2SARequiredException,
+                PyiCloudAuthRequiredException,
+                PyiCloudFailedLoginException,
+            ),
+        ):
+            return True
+        return False
 
     def _download_job(self, path):
         retry_delay = None
@@ -984,6 +1084,16 @@ class ICloudSyncEngine:
                     total,
                 )
         except Exception as exc:
+            if self._is_auth_error(exc):
+                self.logger.error(
+                    "Warmup download blocked by expired iCloud authentication for %s: %s. "
+                    "Run './icloudctl auth' and then './icloudctl restart'.",
+                    path,
+                    exc,
+                )
+                with self.downloads_lock:
+                    self.download_retry_attempts.pop(path, None)
+                return
             with self.downloads_lock:
                 attempt = self.download_retry_attempts.get(path, 0) + 1
                 self.download_retry_attempts[path] = attempt
@@ -1128,7 +1238,10 @@ class ICloudSyncEngine:
             if destination is None:
                 raise RuntimeError(f"Remote parent not available for {new_parent}")
             self.api.drive.move_nodes_to_node([node], destination)
-            node = self._refresh_node_by_id(entry["remote_drivewsid"])
+            node = self._refresh_node_by_id(
+                entry["remote_drivewsid"],
+                entry.get("remote_shareid"),
+            )
         if old_name != new_name:
             node.rename(new_name)
 
@@ -1166,12 +1279,22 @@ class ICloudSyncEngine:
             return None
         return self._node_from_entry(entry)
 
-    def _refresh_node_by_id(self, remote_drivewsid):
-        data = self.api.drive.get_node_data(remote_drivewsid)
+    def _refresh_node_by_id(self, remote_drivewsid, remote_shareid=None):
+        data = self.api.drive.get_node_data(remote_drivewsid, remote_shareid)
         return DriveNode(self.api.drive, data)
 
     def _node_from_entry(self, entry):
-        return self._refresh_node_by_id(entry["remote_drivewsid"])
+        data = {
+            "drivewsid": entry["remote_drivewsid"],
+            "docwsid": entry.get("remote_docwsid"),
+            "etag": entry.get("remote_etag"),
+            "zone": entry.get("remote_zone"),
+            "shareID": entry.get("remote_shareid"),
+            "size": int(entry.get("size", 0) or 0),
+            "type": entry.get("type", "file").upper(),
+            "name": os.path.basename(entry["path"].rstrip("/")) or "root",
+        }
+        return DriveNode(self.api.drive, data)
 
     def _node_to_meta(self, node, path):
         data = node.data
@@ -1188,6 +1311,7 @@ class ICloudSyncEngine:
             "remote_docwsid": data.get("docwsid"),
             "remote_etag": data.get("etag"),
             "remote_zone": data.get("zone"),
+            "remote_shareid": data.get("shareID"),
             "size": size,
             "mtime": parse_remote_time(data.get("dateModified")),
         }
@@ -1228,6 +1352,10 @@ class ICloudFS(Fuse):
         self.mirror = None
         self.state = None
         self.sync_engine = None
+
+    def shutdown(self):
+        if self.sync_engine is not None:
+            self.sync_engine.shutdown()
 
     def init_icloud(self, username, password, cache_dir, cookie_dir=None):
         self.username = username
@@ -1285,6 +1413,7 @@ class ICloudFS(Fuse):
         conflict_mode,
         upload_interval_seconds,
         remote_refresh_interval_seconds,
+        warmup_workers,
     ):
         self.mirror = LocalMirror(cache_dir)
         state_path = os.path.join(cache_dir, "state.sqlite3")
@@ -1298,6 +1427,7 @@ class ICloudFS(Fuse):
             conflict_mode=conflict_mode,
             upload_interval_seconds=upload_interval_seconds,
             remote_refresh_interval_seconds=remote_refresh_interval_seconds,
+            warmup_workers=warmup_workers,
         )
         self.sync_engine.start()
 
@@ -1648,6 +1778,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         handlers=[logging.StreamHandler(), logging.FileHandler(log_path)],
     )
     logger = logging.getLogger("icloud")
+    logging.getLogger("pyicloud.base").addFilter(IgnoreIcdrsWarning())
 
     config = parse_config(args.config)
     username = config.get("username")
@@ -1662,6 +1793,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     conflict_mode = config.get("conflict_mode", "copy")
     upload_interval_seconds = int(config.get("upload_interval_seconds", 30))
     remote_refresh_interval_seconds = int(config.get("remote_refresh_interval_seconds", 300))
+    warmup_workers = int(config.get("warmup_workers", 1))
 
     fs.init_icloud(username, password, cache_dir, cookie_dir)
     fs.init_local_cache(
@@ -1670,8 +1802,23 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         conflict_mode,
         upload_interval_seconds,
         remote_refresh_interval_seconds,
+        warmup_workers,
     )
-    fs.main()
+
+    atexit.register(fs.shutdown)
+
+    def handle_shutdown(signum, frame):
+        logger.info("Received signal %s, shutting down background sync", signum)
+        fs.shutdown()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+
+    try:
+        fs.main()
+    finally:
+        fs.shutdown()
 
 
 if __name__ == "__main__":
