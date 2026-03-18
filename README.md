@@ -1,25 +1,71 @@
 # icloud-linux
 
-Mount iCloud Drive on Linux with a local-first FUSE filesystem, persistent disk cache, and a real background sync engine.
+Mount iCloud Drive on Linux as a fast local-first FUSE filesystem with persistent caching, background hydration, and bidirectional sync.
 
-`icloud-linux` is built to feel fast under normal filesystem workloads:
-- directory walks, `find`, `rg`, editors, and shell tools run against a local mirror instead of waiting on iCloud for every operation
-- file contents are cached on disk under `~/.cache/icloud-linux/mirror`
-- local writes complete immediately and sync back to iCloud asynchronously
-- remote changes are pulled in by a periodic refresh loop instead of blocking foreground reads
+## What This Is
 
-## Why it feels fast
+`icloud-linux` makes your iCloud Drive show up like a normal folder on Linux.
 
-- **Persistent local mirror**: metadata and file contents are cached on disk, not only in memory.
-- **Local-first reads**: once metadata is known, normal filesystem operations are served from the mirror.
-- **Persistent restarts**: after the first initialization crawl, restarts reuse the existing mirror and sync state instead of rebuilding cache from scratch.
-- **Background warmup**: the first initialization does a metadata sync before mount, then hydrates file contents in the background.
-- **Conservative downloads**: warmup downloads are serialized by default because parallel iCloud reads appear to trigger server-side auth/throttling failures.
-- **Real sync engine**: uploads and remote refreshes happen on timers, decoupled from `open`, `read`, `write`, and `readdir`.
-- **Retrying hydrator**: transient iCloud download failures stay queued and are retried with backoff until they succeed.
-- **Conflict preservation**: if local and remote both changed, the local version is kept as a conflict copy instead of being silently lost.
+It is designed to feel much more local than a naive network mount:
 
-## TL;DR (fast setup)
+- folders and filenames are cached on disk
+- file contents are downloaded into a local mirror
+- reads usually come from local storage, not from iCloud on every access
+- local changes are written immediately and synced back in the background
+- remote changes are pulled in by a real sync engine
+
+In practice, that means `find`, editors, shells, and normal file browsing work against a persistent local cache instead of blocking on iCloud for every operation.
+
+## How It Works
+
+There are three main pieces:
+
+- Metadata crawl: the first run scans your iCloud Drive and builds a local index.
+- Background hydration: after metadata is known, file contents are downloaded into the local cache.
+- Sync engine: local edits upload in the background and remote changes are refreshed on a timer.
+
+Important behavior:
+
+- The mount is local-first.
+- Restarts reuse the existing cache instead of starting from zero.
+- If you open a file before it has finished hydrating, that file is downloaded first and then served locally.
+- Failed warmup downloads are retried automatically with backoff.
+- If a path changed both locally and remotely, the local version is preserved as a conflict copy instead of being silently overwritten.
+
+## Who This Is For
+
+This project is for people who want:
+
+- a normal folder they can browse on Linux
+- Apple ID + 2FA support
+- a persistent local cache
+- real background syncing instead of only on-demand reads
+
+If you want a quick setup and do not care about the internal details, use `./icloudctl quickstart`.
+
+## Requirements
+
+You need:
+
+- Linux
+- Python 3 with `venv`
+- FUSE
+- `systemctl --user`
+
+### Debian / Ubuntu
+
+```bash
+sudo apt-get update
+sudo apt-get install -y fuse libfuse-dev pkg-config python3-venv
+```
+
+### Fedora
+
+```bash
+sudo dnf install python3-devel fuse fuse-libs fuse-devel gcc make
+```
+
+## Fast Setup
 
 ```bash
 git clone https://github.com/ismaeelakram/icloud-linux.git
@@ -27,111 +73,161 @@ cd icloud-linux
 ./icloudctl quickstart ~/iCloud
 ```
 
-`quickstart` will:
-1. create a virtualenv and install Python deps
-2. initialize user config/service files
-3. prompt for Apple ID credentials
-4. run one-time interactive 2FA auth
-5. start the user service
+This will:
 
-## Why this works with 2FA
+1. create the Python virtual environment
+2. install dependencies
+3. create the config and user service
+4. ask for your Apple ID email and password
+5. run the one-time interactive authentication flow
+6. start the background service
 
-Systemd services are non-interactive, so they cannot wait for 2FA input.
+After setup, your files will be mounted at `~/iCloud` unless you chose another path.
 
-This project uses a **two-phase auth flow**:
-- `./icloudctl auth` (interactive, one-time) stores trusted session cookies
-- `icloud.service` (background) reuses saved cookies and runs non-interactively
+## Simple Setup, Step By Step
 
-If cookies expire, just run `./icloudctl auth` again.
-
-## How the filesystem behaves now
-
-- The mount is **local-first**. On first initialization, a metadata crawl runs before mount. After that, restarts reuse the persistent disk mirror in `~/.cache/icloud-linux/mirror` and refresh remote metadata in the background.
-- File contents warm in the background by default. If you open a file before it has been hydrated, that one file is downloaded first and then served locally.
-- Local writes are committed to the mirror immediately and uploaded asynchronously every `30s` by default.
-- Remote metadata is refreshed every `300s` by default.
-- File downloads that fail during warmup are retried automatically with backoff until they hydrate successfully.
-- If the same path changed locally and remotely before sync, the local version is preserved as `*.local-conflict-<timestamp>`.
-
-## Commands
+If you prefer to do setup one step at a time:
 
 ```bash
-./icloudctl init [mount_dir]      # prepare venv/config/service
-./icloudctl configure [email]      # write config.yaml interactively
-./icloudctl auth                   # one-time 2FA bootstrap
-./icloudctl clear-cache            # remove local mirror/state and rebuild it
-./icloudctl start|stop|restart
-./icloudctl status
-./icloudctl logs
-./icloudctl doctor
-./icloudctl uninstall [--purge]
+./icloudctl init ~/iCloud
+./icloudctl configure
+./icloudctl auth
+./icloudctl start
 ```
 
-## Files and paths
+## Why Authentication Is Split Into Two Steps
 
-- Config: `~/.config/icloud-linux/config.yaml`
-- Service env: `~/.config/icloud-linux/icloud.env`
-- Session cookies: `~/.config/icloud-linux/cookies`
-- Cache root: `~/.cache/icloud-linux`
-- Local mirror: `~/.cache/icloud-linux/mirror`
-- Sync state DB: `~/.cache/icloud-linux/state.sqlite3`
-- Logs: `~/.local/state/icloud-linux/icloud.log`
-- Systemd user service: `~/.config/systemd/user/icloud.service`
+Systemd user services are non-interactive. They cannot pause and wait for a 2FA code.
 
-## Debian/Ubuntu prerequisites
+So this project uses:
 
-You need FUSE + Python tooling installed once:
+- `./icloudctl auth` for the interactive one-time Apple login and 2FA flow
+- a generated user service that reuses the saved session cookies in the background
 
-```bash
-sudo apt-get update
-sudo apt-get install -y fuse libfuse-dev pkg-config python3-venv
-```
-
-## Fedora prerequisites
-
-```bash
-sudo dnf install python3-devel fuse fuse-libs fuse-devel gcc make
-```
-
-## Troubleshooting
-
-### Service won’t start
-
-```bash
-./icloudctl status
-./icloudctl logs
-```
-
-### Auth/2FA errors
-
-Run again:
+If Apple expires your session, run:
 
 ```bash
 ./icloudctl auth
 ./icloudctl restart
 ```
 
-### Check setup health
+## Everyday Commands
 
 ```bash
+./icloudctl start
+./icloudctl stop
+./icloudctl restart
+./icloudctl status
+./icloudctl logs
 ./icloudctl doctor
+./icloudctl clear-cache
+./icloudctl uninstall
 ```
 
-### Verify local-first behavior
+What they do:
 
-After the service has had time to warm the cache, a large traversal should run without triggering foreground iCloud fetches:
+- `start`: starts the background user service
+- `stop`: stops the service and unmounts the folder
+- `restart`: restarts the service cleanly
+- `status`: shows whether the service is running
+- `logs`: tails the service logs
+- `doctor`: checks common setup issues
+- `clear-cache`: deletes the local mirror and sync database, then rebuilds them on next start
+- `uninstall`: removes the generated user service
+
+## What Happens After You Start It
+
+On the first run:
+
+- the service crawls your iCloud Drive metadata
+- it mounts the folder
+- it starts downloading file contents into the local cache in the background
+
+On later runs:
+
+- it reuses the cache stored on disk
+- it refreshes remote metadata in the background
+- it continues hydrating anything still missing
+
+Local file writes are committed to the mirror immediately and uploaded by the sync engine in the background.
+
+## Local Cache And Sync State
+
+The project keeps its local state here:
+
+- Config: `~/.config/icloud-linux/config.yaml`
+- Session cookies: `~/.config/icloud-linux/cookies`
+- Service env: `~/.config/icloud-linux/icloud.env`
+- User service: `~/.config/systemd/user/icloud.service`
+- Local cache root: `~/.cache/icloud-linux`
+- Local mirror: `~/.cache/icloud-linux/mirror`
+- Sync state database: `~/.cache/icloud-linux/state.sqlite3`
+- Logs: `~/.local/state/icloud-linux/icloud.log`
+
+## What “Sync Engine” Means Here
+
+This repo is not just a read-only mount and it is not only a foreground downloader.
+
+The sync engine:
+
+- tracks local dirty files and directories
+- uploads local changes on a timer
+- refreshes remote metadata on a timer
+- hydrates missing file contents in the background
+- preserves local conflict copies when local and remote diverge
+
+That makes it closer to a real cached sync client than a simple network filesystem wrapper.
+
+## Troubleshooting
+
+### The service will not start
+
+Run:
+
+```bash
+./icloudctl status
+./icloudctl doctor
+./icloudctl logs
+```
+
+### Authentication expired
+
+Run:
+
+```bash
+./icloudctl auth
+./icloudctl restart
+```
+
+### I want to rebuild everything locally
+
+Run:
+
+```bash
+./icloudctl clear-cache
+```
+
+That removes the local mirror and sync database. The next start will rebuild them from iCloud.
+
+### I want to confirm it is using the local cache
+
+After the service has had time to hydrate files:
 
 ```bash
 find ~/iCloud -type f | head
 rg --files ~/iCloud | head
 ```
 
-Use `./icloudctl logs` in another terminal and confirm activity is mostly background refresh/upload logging rather than a remote fetch per file operation.
-
-### Rebuild the persistent cache
-
-If you want to throw away the local mirror and sync DB without reinstalling the service:
+You can watch logs in another terminal:
 
 ```bash
-./icloudctl clear-cache
+./icloudctl logs
 ```
+
+Normal activity should mostly look like background crawl, hydration, and sync logs rather than a separate remote fetch for every file operation.
+
+## Notes
+
+- Warmup downloads are intentionally conservative because iCloud file downloads are sensitive to aggressive parallelism.
+- The generated systemd unit is created by `./icloudctl`; the repo does not rely on checked-in service files anymore.
+- This project currently targets a user-level systemd service, not a system-wide root service.
