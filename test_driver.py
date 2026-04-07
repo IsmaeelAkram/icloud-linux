@@ -1,3 +1,4 @@
+import io
 import os
 import shutil
 import sqlite3
@@ -7,6 +8,13 @@ from unittest.mock import Mock
 
 from driver import ICloudSyncEngine, LocalMirror, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
+
+
+class NoUnboundedReadStream(io.BytesIO):
+    def read(self, size=-1):
+        if size is None or size < 0:
+            raise AssertionError("stream was read without a chunk size")
+        return super().read(size)
 
 
 class DriverStateTests(unittest.TestCase):
@@ -25,6 +33,13 @@ class DriverStateTests(unittest.TestCase):
 
         self.mirror.truncate("/docs/a.txt", 2)
         self.assertEqual(self.mirror.read("/docs/a.txt", 10, 0), b"he")
+
+    def test_write_atomic_stream_copies_in_chunks(self):
+        stream = NoUnboundedReadStream(b"streamed content")
+
+        self.mirror.write_atomic_stream("/docs/a.txt", stream)
+
+        self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"streamed content")
 
     def test_rename_tree_preserves_old_synced_paths_for_local_rename(self):
         self.state.upsert_entry(
@@ -317,6 +332,82 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(node.data["docwsid"], "doc-1")
         self.assertEqual(node.data["shareID"], shareid)
         self.assertEqual(node.data["size"], 5)
+
+    def test_ensure_local_file_streams_remote_content_in_chunks(self):
+        self.state.upsert_entry(
+            {
+                "path": "/docs/a.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_zone": "zone-1",
+                "size": 16,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/docs/a.txt",
+            }
+        )
+        self.mirror.ensure_dir("/docs")
+        response = Mock()
+        response.raw = NoUnboundedReadStream(b"chunked download")
+        response.close = Mock()
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine.ensure_local_file("/docs/a.txt")
+
+        self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"chunked download")
+        response.close.assert_called_once()
+
+    def test_sync_file_uploads_stream_without_buffering_entire_file(self):
+        self.mirror.create_file("/docs/a.txt")
+        self.mirror.write("/docs/a.txt", b"hello world", 0)
+        self.state.upsert_entry(
+            {
+                "path": "/docs/a.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": None,
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": "/docs/a.txt",
+            }
+        )
+        upload_state = {}
+
+        def capture_upload(stream):
+            upload_state["class_name"] = stream.__class__.__name__
+            upload_state["name"] = stream.name
+            upload_state["prefix"] = stream.read(5)
+
+        parent_node = Mock()
+        parent_node.upload.side_effect = capture_upload
+        self.engine._ensure_remote_parent = Mock(return_value=parent_node)
+        self.engine.ensure_local_file = Mock()
+        self.engine._refresh_child_meta = Mock(
+            return_value={
+                "path": "/docs/a.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_etag": "etag-1",
+                "remote_zone": "zone-1",
+                "size": 11,
+                "mtime": 123,
+            }
+        )
+
+        self.engine._sync_file(self.state.get_entry("/docs/a.txt"))
+
+        self.assertEqual(upload_state["class_name"], "NamedFileStream")
+        self.assertEqual(upload_state["name"], "a.txt")
+        self.assertEqual(upload_state["prefix"], b"hello")
 
 
 if __name__ == "__main__":

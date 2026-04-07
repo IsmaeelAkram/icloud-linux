@@ -15,9 +15,9 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import closing
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
 
 import fuse
 import yaml
@@ -40,6 +40,7 @@ fuse.fuse_python_api = (0, 2)
 
 
 ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
+IO_CHUNK_SIZE = 1024 * 1024
 
 
 class Stat(fuse.Stat):
@@ -85,6 +86,15 @@ def sha256_file(path):
 
 def row_to_dict(row):
     return dict(row) if row is not None else None
+
+
+class NamedFileStream:
+    def __init__(self, handle, name):
+        self._handle = handle
+        self.name = name
+
+    def __getattr__(self, attr):
+        return getattr(self._handle, attr)
 
 
 class SyncState:
@@ -589,6 +599,20 @@ class LocalMirror:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
+    def write_atomic_stream(self, path, source, mtime=None, chunk_size=IO_CHUNK_SIZE):
+        self.ensure_parent(path)
+        local = self.local_path(path)
+        fd, tmp_path = tempfile.mkstemp(dir=self.tmp_dir)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                shutil.copyfileobj(source, handle, length=chunk_size)
+            os.replace(tmp_path, local)
+            if mtime is not None:
+                os.utime(local, (mtime, mtime))
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
     def read(self, path, size, offset):
         local = self.local_path(path)
         with open(local, "rb") as handle:
@@ -856,8 +880,8 @@ class ICloudSyncEngine:
                     entry.get("size"),
                 )
                 node = self._node_from_entry(entry)
-                content = node.open(stream=True).raw.read()
-            self.mirror.write_atomic_bytes(path, content, entry["mtime"])
+                with closing(node.open(stream=True)) as response:
+                    self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
             self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
@@ -1279,9 +1303,9 @@ class ICloudSyncEngine:
                     pass
 
             with open(self.mirror.local_path(entry["path"]), "rb") as handle:
-                file_obj = BytesIO(handle.read())
-            file_obj.name = os.path.basename(entry["path"])
-            parent_node.upload(file_obj)
+                parent_node.upload(
+                    NamedFileStream(handle, os.path.basename(entry["path"]))
+                )
 
             meta = self._refresh_child_meta(os.path.dirname(entry["path"]) or "/", os.path.basename(entry["path"]))
             checksum = self.mirror.file_sha256(entry["path"])
