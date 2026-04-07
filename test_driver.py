@@ -26,6 +26,13 @@ class DriverStateTests(unittest.TestCase):
         self.mirror.truncate("/docs/a.txt", 2)
         self.assertEqual(self.mirror.read("/docs/a.txt", 10, 0), b"he")
 
+    def test_ensure_dir_replaces_file_placeholder(self):
+        self.mirror.create_file("/Obsidian")
+
+        self.mirror.ensure_dir("/Obsidian")
+
+        self.assertTrue(self.mirror.is_dir("/Obsidian"))
+
     def test_rename_tree_preserves_old_synced_paths_for_local_rename(self):
         self.state.upsert_entry(
             {
@@ -153,6 +160,29 @@ class DriverStateTests(unittest.TestCase):
 
         entry = self.state.get_entry("/docs/a.txt")
         self.assertEqual(entry["hydrated"], 0)
+
+    def test_reconcile_persistent_cache_replaces_app_library_placeholder(self):
+        self.state.upsert_entry(
+            {
+                "path": "/Obsidian",
+                "type": "app_library",
+                "parent_path": "/",
+                "remote_drivewsid": "folder-1",
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/Obsidian",
+            }
+        )
+        self.mirror.create_file("/Obsidian")
+
+        api = Mock()
+        api.drive.root = Mock()
+        engine = ICloudSyncEngine(api, self.mirror, self.state, Mock())
+
+        engine._reconcile_persistent_cache()
+
+        self.assertTrue(self.mirror.is_dir("/Obsidian"))
 
     def test_remote_shareid_round_trips_through_state(self):
         self.state.upsert_entry(
@@ -317,6 +347,60 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(node.data["docwsid"], "doc-1")
         self.assertEqual(node.data["shareID"], shareid)
         self.assertEqual(node.data["size"], 5)
+
+    def test_crawl_descends_into_app_library_nodes(self):
+        note = Mock()
+        note.name = "vault.md"
+        note.data = {
+            "type": "FILE",
+            "drivewsid": "file-1",
+            "docwsid": "doc-1",
+            "etag": "etag-1",
+            "zone": "zone-1",
+            "size": 12,
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        obsidian = Mock()
+        obsidian.name = "Obsidian"
+        obsidian.data = {
+            "type": "APP_LIBRARY",
+            "drivewsid": "folder-1",
+            "docwsid": "documents",
+            "etag": "etag-folder",
+            "zone": "zone-1",
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        obsidian.get_children.return_value = [note]
+        root = Mock()
+        root.get_children.return_value = [obsidian]
+        self.engine.api.drive.root = root
+
+        snapshot = self.engine._crawl_remote_snapshot()
+
+        self.assertIn("folder-1", snapshot)
+        self.assertIn("file-1", snapshot)
+        self.assertEqual(snapshot["folder-1"]["path"], "/Obsidian")
+        self.assertEqual(snapshot["folder-1"]["type"], "app_library")
+        self.assertEqual(snapshot["file-1"]["path"], "/Obsidian/vault.md")
+
+    def test_materialize_remote_entry_treats_app_library_as_directory(self):
+        self.engine._materialize_remote_entry(
+            {
+                "path": "/Obsidian",
+                "type": "app_library",
+                "parent_path": "/",
+                "remote_drivewsid": "folder-1",
+                "remote_docwsid": "documents",
+                "remote_etag": "etag-folder",
+                "remote_zone": "zone-1",
+                "size": 0,
+                "mtime": 123,
+            }
+        )
+
+        self.assertTrue(self.mirror.is_dir("/Obsidian"))
+        entry = self.state.get_entry("/Obsidian")
+        self.assertEqual(entry["hydrated"], 1)
 
 
 if __name__ == "__main__":

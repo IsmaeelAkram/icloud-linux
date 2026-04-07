@@ -40,6 +40,7 @@ fuse.fuse_python_api = (0, 2)
 
 
 ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
+DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 
 
 class Stat(fuse.Stat):
@@ -560,7 +561,10 @@ class LocalMirror:
         return local
 
     def ensure_dir(self, path):
-        os.makedirs(self.local_path(path), exist_ok=True)
+        local = self.local_path(path)
+        if os.path.exists(local) and not os.path.isdir(local):
+            os.unlink(local)
+        os.makedirs(local, exist_ok=True)
 
     def ensure_parent(self, path):
         parent = os.path.dirname(path) or "/"
@@ -759,8 +763,8 @@ class ICloudSyncEngine:
             path = entry["path"]
             if entry["tombstone"]:
                 continue
-            if entry["type"] == "folder":
-                if not self.mirror.exists(path):
+            if self._is_directory_type(entry["type"]):
+                if not self.mirror.is_dir(path):
                     self.mirror.ensure_dir(path)
                     recreated_dirs += 1
                 continue
@@ -807,6 +811,9 @@ class ICloudSyncEngine:
             recreated_dirs,
             missing_files,
         )
+
+    def _is_directory_type(self, node_type):
+        return (node_type or "").lower() in DIRECTORY_NODE_TYPES
 
     def ensure_local_file(self, path):
         entry = self.state.get_entry(path)
@@ -886,7 +893,7 @@ class ICloudSyncEngine:
                 child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
                 meta = self._node_to_meta(child, child_path)
                 snapshot[meta["remote_drivewsid"]] = meta
-                if meta["type"] == "folder":
+                if self._is_directory_type(meta["type"]):
                     queue.append((child, child_path))
 
             now = time.time()
@@ -949,7 +956,7 @@ class ICloudSyncEngine:
             drivewsid=meta.get("remote_drivewsid"),
             size=meta.get("size"),
         )
-        if meta["type"] == "folder":
+        if self._is_directory_type(meta["type"]):
             self.mirror.ensure_dir(local_path)
             hydrated = True
         else:
@@ -980,7 +987,7 @@ class ICloudSyncEngine:
             self.state.rename_tree(oldpath, newpath, root_dirty=False, update_synced=True)
             entry = self.state.get_entry(newpath)
 
-        if meta["type"] == "folder":
+        if self._is_directory_type(meta["type"]):
             self.mirror.ensure_dir(newpath)
             self.state.upsert_entry(
                 {
@@ -1368,7 +1375,7 @@ class ICloudSyncEngine:
     def _node_to_meta(self, node, path):
         data = node.data
         node_type = data.get("type", "FILE").lower()
-        if node_type == "folder":
+        if self._is_directory_type(node_type):
             size = 0
         else:
             size = int(data.get("size", 0) or 0)
@@ -1541,8 +1548,9 @@ class ICloudFS(Fuse):
             return attrs
 
         if entry and not entry["tombstone"]:
-            attrs.st_mode = (stat.S_IFDIR | 0o755) if entry["type"] == "folder" else (stat.S_IFREG | 0o644)
-            attrs.st_nlink = 2 if entry["type"] == "folder" else 1
+            is_directory = self.sync_engine._is_directory_type(entry["type"])
+            attrs.st_mode = (stat.S_IFDIR | 0o755) if is_directory else (stat.S_IFREG | 0o644)
+            attrs.st_nlink = 2 if is_directory else 1
             attrs.st_size = entry["size"]
             attrs.st_ctime = entry["mtime"] or now
             attrs.st_mtime = entry["mtime"] or now
