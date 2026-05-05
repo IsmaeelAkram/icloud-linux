@@ -1446,7 +1446,19 @@ class ICloudFS(Fuse):
             os.makedirs(cookie_dir, exist_ok=True)
 
         try:
-            self.api = PyiCloudService(username, password, cookie_directory=cookie_dir)
+            # Resolve Apple account partition (fixes 421 redirect for non-default shards)
+            import requests as _req
+            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={})
+            _partition = _r.headers.get("x-apple-user-partition")
+
+            self.api = PyiCloudService(username, password,
+                                       cookie_directory=cookie_dir,
+                                       authenticate=False)
+            if _partition:
+                self.api._setup_endpoint = (
+                    f"https://p{_partition}-setup.icloud.com/setup/ws/1"
+                )
+            self.api.authenticate()
             if self.api.requires_2fa:
                 if sys.stdin.isatty():
                     print("Two-factor authentication required.")
