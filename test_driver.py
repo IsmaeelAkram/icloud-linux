@@ -298,6 +298,13 @@ class SyncEngineStartupTests(unittest.TestCase):
 
         self.assertNotIn("/docs/a.txt", self.engine.scheduled_downloads)
 
+    def test_request_remote_refresh_sets_wakeup_event(self):
+        self.assertFalse(self.engine.refresh_now_event.is_set())
+
+        self.engine.request_remote_refresh()
+
+        self.assertTrue(self.engine.refresh_now_event.is_set())
+
     def test_node_from_entry_reuses_persisted_file_metadata(self):
         shareid = {"share-zone": "abc"}
         node = self.engine._node_from_entry(
