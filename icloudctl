@@ -13,6 +13,24 @@ MOUNT_DIR_DEFAULT="$HOME/iCloud"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1"; exit 1; }; }
 
+reject_control_chars() {
+  local label="$1"
+  local value="$2"
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "$label must not contain newlines"
+    exit 1
+  fi
+}
+
+systemd_quote_arg() {
+  local value="$1"
+  reject_control_chars "systemd argument" "$value"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//%/%%}
+  printf '"%s"' "$value"
+}
+
 ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR" "$SERVICE_DIR"
 }
@@ -35,6 +53,13 @@ create_config_if_missing() {
 
 write_service() {
   local mount_dir="$1"
+  local python_bin="$REPO_DIR/.venv/bin/python"
+  local driver_py="$REPO_DIR/driver.py"
+  local python_bin_q driver_py_q config_file_q mount_dir_q
+  python_bin_q="$(systemd_quote_arg "$python_bin")"
+  driver_py_q="$(systemd_quote_arg "$driver_py")"
+  config_file_q="$(systemd_quote_arg "$CONFIG_FILE")"
+  mount_dir_q="$(systemd_quote_arg "$mount_dir")"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=iCloud Linux FUSE filesystem (user)
@@ -43,14 +68,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=-/usr/bin/fusermount -uz $mount_dir
-ExecStop=-/usr/bin/fusermount -uz $mount_dir
-ExecStart=$REPO_DIR/.venv/bin/python $REPO_DIR/driver.py -f -c $CONFIG_FILE $mount_dir
+ExecStartPre=-/usr/bin/fusermount -uz $mount_dir_q
+ExecStop=-/usr/bin/fusermount -uz $mount_dir_q
+ExecStart=$python_bin_q $driver_py_q -f -c $config_file_q $mount_dir_q
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=10
 KillMode=control-group
-ExecStopPost=-/usr/bin/fusermount -uz $mount_dir
+ExecStopPost=-/usr/bin/fusermount -uz $mount_dir_q
 Environment=ICLOUD_LOG_PATH=%h/.local/state/icloud-linux/icloud.log
 
 [Install]
@@ -61,10 +86,11 @@ EOF
 write_env() {
   local mount_dir="${1:-$MOUNT_DIR_DEFAULT}"
   mkdir -p "$mount_dir"
-  cat > "$ENV_FILE" <<EOF
-ICLOUD_CONFIG=$CONFIG_FILE
-ICLOUD_MOUNT=$mount_dir
-EOF
+  reject_control_chars "mount dir" "$mount_dir"
+  {
+    printf 'ICLOUD_CONFIG=%q\n' "$CONFIG_FILE"
+    printf 'ICLOUD_MOUNT=%q\n' "$mount_dir"
+  } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
 }
 
@@ -165,6 +191,14 @@ cmd_stop() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; clean
 cmd_restart() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
 cmd_status() { systemctl --user --no-pager status icloud.service; }
 cmd_logs() { journalctl --user -u icloud.service -f; }
+cmd_refresh() {
+  if ! systemctl --user is-active --quiet icloud.service; then
+    echo "icloud.service is not running. Start it with './icloudctl start' first."
+    exit 1
+  fi
+  systemctl --user kill --kill-whom=main --signal=SIGUSR1 icloud.service
+  echo "Requested remote metadata crawl. Watch progress with './icloudctl logs'."
+}
 cmd_clear_cache() {
   local was_active=0
   systemctl --user is-active --quiet icloud.service && was_active=1 || true
@@ -244,6 +278,7 @@ Commands:
   auth                     Run interactive 2FA bootstrap
   clear-cache              Remove local mirror/state and rebuild on next start
   start|stop|restart       Service control
+  refresh                  Trigger a remote metadata crawl now
   status                   Show service status
   logs                     Tail service logs
   doctor                   Check local setup health
@@ -263,6 +298,7 @@ main() {
     start) cmd_start ;;
     stop) cmd_stop ;;
     restart) cmd_restart ;;
+    refresh) cmd_refresh ;;
     status) cmd_status ;;
     logs) cmd_logs ;;
     doctor) cmd_doctor ;;
