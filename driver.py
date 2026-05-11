@@ -670,6 +670,7 @@ class ICloudSyncEngine:
         upload_interval_seconds=30,
         remote_refresh_interval_seconds=300,
         warmup_workers=1,
+        sync_paths=None,
     ):
         self.api = api
         self.mirror = mirror
@@ -680,6 +681,11 @@ class ICloudSyncEngine:
         self.upload_interval_seconds = upload_interval_seconds
         self.remote_refresh_interval_seconds = remote_refresh_interval_seconds
         self.warmup_workers = max(1, int(warmup_workers))
+        # Normalise sync_paths: list of /-prefixed strings, or None = allow all
+        if sync_paths:
+            self.sync_paths = [p if p.startswith('/') else '/' + p for p in sync_paths]
+        else:
+            self.sync_paths = None
         self.executor = ThreadPoolExecutor(max_workers=self.warmup_workers, thread_name_prefix="warmup")
         self.stop_event = threading.Event()
         self.path_locks = {}
@@ -809,6 +815,8 @@ class ICloudSyncEngine:
         )
 
     def ensure_local_file(self, path):
+        if not self._path_allowed(path):
+            return
         entry = self.state.get_entry(path)
         if not entry or entry["type"] != "file" or entry["tombstone"]:
             return
@@ -1055,6 +1063,8 @@ class ICloudSyncEngine:
         self._schedule_download_with_delay(path, 0)
 
     def _schedule_download_with_delay(self, path, delay_seconds):
+        if not self._path_allowed(path):
+            return
         if self.stop_event.is_set() or self.is_shutdown:
             return
 
@@ -1401,6 +1411,15 @@ class ICloudSyncEngine:
             else dirname.rstrip("/") + "/" + f"{basename}.local-conflict-{stamp}"
         )
 
+    def _path_allowed(self, path):
+        """Return True if this path should be hydrated/downloaded."""
+        if self.sync_paths is None:
+            return True
+        for prefix in self.sync_paths:
+            if path == prefix or path.startswith(prefix + '/'):
+                return True
+        return False
+
     def _path_lock(self, path):
         with self.path_locks_lock:
             lock = self.path_locks.get(path)
@@ -1506,6 +1525,7 @@ class ICloudFS(Fuse):
         upload_interval_seconds,
         remote_refresh_interval_seconds,
         warmup_workers,
+        sync_paths=None,
     ):
         self.mirror = LocalMirror(cache_dir)
         state_path = os.path.join(cache_dir, "state.sqlite3")
@@ -1520,6 +1540,7 @@ class ICloudFS(Fuse):
             upload_interval_seconds=upload_interval_seconds,
             remote_refresh_interval_seconds=remote_refresh_interval_seconds,
             warmup_workers=warmup_workers,
+            sync_paths=sync_paths,
         )
         self.sync_engine.start()
 
@@ -1897,6 +1918,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     upload_interval_seconds = int(config.get("upload_interval_seconds", 30))
     remote_refresh_interval_seconds = int(config.get("remote_refresh_interval_seconds", 300))
     warmup_workers = int(config.get("warmup_workers", 1))
+    sync_paths = config.get("sync_paths", None)  # list of iCloud paths to hydrate, None=all
 
     fs.init_icloud(username, password, cache_dir, cookie_dir)
     fs.init_local_cache(
@@ -1906,6 +1928,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         upload_interval_seconds,
         remote_refresh_interval_seconds,
         warmup_workers,
+        sync_paths=sync_paths,
     )
 
     atexit.register(fs.shutdown)
