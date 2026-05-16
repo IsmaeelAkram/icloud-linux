@@ -776,8 +776,14 @@ class ICloudSyncEngine:
                 checksum = entry.get("local_sha256")
                 hydrated = bool(entry["hydrated"])
                 if entry["type"] == "file" and (hydrated or not entry["remote_drivewsid"]):
-                    checksum = self.mirror.file_sha256(path)
                     hydrated = True
+                    # Only recompute the SHA256 if size or mtime changed since
+                    # the last recorded sync — reading every file on startup is
+                    # the cause of the 4-minute / 11 GB memory blowup at boot.
+                    size_changed = stats.st_size != int(entry.get("size") or 0)
+                    mtime_changed = int(stats.st_mtime) != int(entry.get("mtime") or 0)
+                    if size_changed or mtime_changed or not checksum:
+                        checksum = self.mirror.file_sha256(path)
                 self.state.upsert_entry(
                     {
                         **entry,
