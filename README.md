@@ -1,6 +1,6 @@
 # icloud-linux
 
-Mount iCloud Drive on Linux as a fast local-first FUSE filesystem with persistent caching, background hydration, and bidirectional sync.
+Mount iCloud Drive on Linux as a fast local-first FUSE filesystem with persistent caching, selective hydration, and on-demand sync.
 
 ## What This Is
 
@@ -9,10 +9,10 @@ Mount iCloud Drive on Linux as a fast local-first FUSE filesystem with persisten
 It is designed to feel much more local than a naive network mount:
 
 - folders and filenames are cached on disk
-- file contents are downloaded into a local mirror
+- file contents are downloaded into a local mirror on demand or in the background
 - reads usually come from local storage, not from iCloud on every access
-- local changes are written immediately and synced back in the background
-- remote changes are pulled in by a real sync engine
+- local changes are written immediately and synced back on the next sync pass
+- remote changes are pulled in by the sync engine on demand or on a timer
 
 In practice, that means `find`, editors, shells, and normal file browsing work against a persistent local cache instead of blocking on iCloud for every operation.
 
@@ -21,8 +21,8 @@ In practice, that means `find`, editors, shells, and normal file browsing work a
 There are three main pieces:
 
 - Metadata crawl: the first run scans your iCloud Drive and builds a local index.
-- Background hydration: after metadata is known, file contents are downloaded into the local cache.
-- Sync engine: local edits upload in the background and remote changes are refreshed on a timer.
+- Hydration: file contents are downloaded into the local cache — either on demand when a file is opened (lazy mode) or proactively in the background (background mode).
+- Sync engine: local edits upload and remote changes are refreshed either automatically on a timer or on demand via `icloudctl sync`.
 
 Important behavior:
 
@@ -31,6 +31,7 @@ Important behavior:
 - If you open a file before it has finished hydrating, that file is downloaded first and then served locally.
 - Failed warmup downloads are retried automatically with backoff.
 - If a path changed both locally and remotely, the local version is preserved as a conflict copy instead of being silently overwritten.
+- With `auto_sync: false`, the driver starts and mounts immediately without spawning background polling threads. Run `icloudctl sync` when you want a fresh pull from iCloud.
 
 ## Who This Is For
 
@@ -39,7 +40,8 @@ This project is for people who want:
 - a normal folder they can browse on Linux
 - Apple ID + 2FA support
 - a persistent local cache
-- real background syncing instead of only on-demand reads
+- control over which folders are hydrated vs stub-only
+- on-demand syncing instead of constant background polling
 
 If you want a quick setup and do not care about the internal details, use `./icloudctl quickstart`.
 
@@ -68,7 +70,7 @@ sudo dnf install python3-devel fuse fuse-libs fuse-devel gcc make
 ## Fast Setup
 
 ```bash
-git clone https://github.com/ismaeelakram/icloud-linux.git
+git clone https://github.com/mslaughter21228/icloud-linux.git
 cd icloud-linux
 ./icloudctl quickstart ~/iCloud
 ```
@@ -111,6 +113,20 @@ If Apple expires your session, run:
 ./icloudctl restart
 ```
 
+### iOS 26 Beta 2FA Workaround
+
+iOS 26 beta may deliver a push notification popup instead of a numeric 2FA code. If this happens, use the `--force-sms` flag to bypass the push path and request an SMS code directly:
+
+```bash
+./icloudctl auth --force-sms
+```
+
+Use `--debug` to see Apple's reported auth mode and diagnose delivery issues:
+
+```bash
+./icloudctl auth --debug
+```
+
 ## Everyday Commands
 
 ```bash
@@ -120,6 +136,8 @@ If Apple expires your session, run:
 ./icloudctl status
 ./icloudctl logs
 ./icloudctl doctor
+./icloudctl hydrate [--dry-run] [--verbose]
+./icloudctl sync [--timeout SECONDS] [--quiet]
 ./icloudctl clear-cache
 ./icloudctl uninstall
 ```
@@ -132,6 +150,8 @@ What they do:
 - `status`: shows whether the service is running
 - `logs`: tails the service logs
 - `doctor`: checks common setup issues
+- `hydrate`: blocks until all eligible files (per `sync_paths` / `exclude_paths`) are fully downloaded locally. Use this before copying files to ensure nothing triggers a mid-copy download. `--dry-run` shows what would be downloaded without actually downloading.
+- `sync`: triggers an on-demand remote metadata sync in the running driver (sends SIGUSR1, waits for completion). Useful when `auto_sync: false` is set.
 - `clear-cache`: deletes the local mirror and sync database, then rebuilds them on next start
 - `uninstall`: removes the generated user service
 
@@ -141,15 +161,65 @@ On the first run:
 
 - the service crawls your iCloud Drive metadata
 - it mounts the folder
-- it starts downloading file contents into the local cache in the background
+- if `warmup_mode: background`, it starts downloading file contents into the local cache
+- if `warmup_mode: lazy`, file contents download only when each file is first opened
 
 On later runs:
 
 - it reuses the cache stored on disk
-- it refreshes remote metadata in the background
-- it continues hydrating anything still missing
+- if `auto_sync: true`, it refreshes remote metadata and uploads local changes on a timer
+- if `auto_sync: false`, it mounts immediately with no background polling; run `icloudctl sync` on demand
 
-Local file writes are committed to the mirror immediately and uploaded by the sync engine in the background.
+## Controlling What Gets Hydrated
+
+By default all of iCloud Drive is indexed (stubs created everywhere), but you can restrict which paths have their file contents downloaded.
+
+**`sync_paths`** — allow-list. Only paths in this list will have file contents downloaded. Everything else is stubs only.
+
+**`exclude_paths`** — deny-list. Paths matching these prefixes are never hydrated, even if they fall under a `sync_path`. The deny-list is evaluated first.
+
+Example config:
+
+```yaml
+# Only hydrate /Downloads
+sync_paths:
+  - /Downloads
+
+# But skip this large subfolder for now
+exclude_paths:
+  - /Downloads/Michael Priority
+```
+
+With this config:
+- `/Downloads/*` → file contents downloaded
+- `/Downloads/Michael Priority/*` → stubs only, no download
+- Everything else on iCloud → stubs only
+
+When you're ready to hydrate an excluded folder, remove it from `exclude_paths` and restart the service.
+
+## Auto-Sync vs On-Demand Sync
+
+**`auto_sync: true`** (default) — background threads poll iCloud on the configured `upload_interval_seconds` and `remote_refresh_interval_seconds` schedules. Good for setups where files change frequently.
+
+**`auto_sync: false`** — no polling threads start. The driver mounts and waits. Use `icloudctl sync` to pull the latest remote changes when you need them. Good for low-churn libraries where constant polling is wasteful and you want predictable resource usage.
+
+When `auto_sync: false`, the recommended workflow is:
+
+```bash
+icloudctl sync          # pull latest metadata from iCloud
+icloudctl hydrate       # download file contents for all eligible paths
+# now copy from mirror: ~/.cache/icloud-linux/mirror/Downloads/
+```
+
+## Copying Files to Another Location
+
+Once files are hydrated, copy from the local mirror rather than from the FUSE mount:
+
+```bash
+cp -r ~/.cache/icloud-linux/mirror/Downloads/ ~/Desktop/intake/
+```
+
+The mirror is a plain directory on disk — reads are instant, no network involved. Copying from the FUSE mount works too but may trigger downloads for any files not yet hydrated.
 
 ## Local Cache And Sync State
 
@@ -163,17 +233,18 @@ The project keeps its local state here:
 - Local mirror: `~/.cache/icloud-linux/mirror`
 - Sync state database: `~/.cache/icloud-linux/state.sqlite3`
 - Logs: `~/.local/state/icloud-linux/icloud.log`
+- On-demand sync marker: `~/.local/state/icloud-linux/sync_done`
 
-## What “Sync Engine” Means Here
+## What "Sync Engine" Means Here
 
 This repo is not just a read-only mount and it is not only a foreground downloader.
 
 The sync engine:
 
 - tracks local dirty files and directories
-- uploads local changes on a timer
-- refreshes remote metadata on a timer
-- hydrates missing file contents in the background
+- uploads local changes (when `auto_sync: true` or on `icloudctl sync`)
+- refreshes remote metadata (when `auto_sync: true` or on `icloudctl sync`)
+- hydrates missing file contents on demand or in the background
 - preserves local conflict copies when local and remote diverge
 
 That makes it closer to a real cached sync client than a simple network filesystem wrapper.
@@ -199,6 +270,15 @@ Run:
 ./icloudctl restart
 ```
 
+### Service starts but auth fails silently (unauthenticated mode)
+
+When running under systemd (no TTY), a failed auth parks the service in unauthenticated mode instead of crashing — this prevents the service from crash-looping and triggering Apple's account lockout. You will see `UNAUTHENTICATED mode` in the logs. Fix by running:
+
+```bash
+./icloudctl auth
+./icloudctl restart
+```
+
 ### I want to rebuild everything locally
 
 Run:
@@ -215,7 +295,6 @@ After the service has had time to hydrate files:
 
 ```bash
 find ~/iCloud -type f | head
-rg --files ~/iCloud | head
 ```
 
 You can watch logs in another terminal:
@@ -224,10 +303,19 @@ You can watch logs in another terminal:
 ./icloudctl logs
 ```
 
-Normal activity should mostly look like background crawl, hydration, and sync logs rather than a separate remote fetch for every file operation.
+Normal activity with `auto_sync: false` will show the reconcile pass at startup and then go quiet until you run `icloudctl sync`.
+
+### I want to check hydration progress
+
+```bash
+./icloudctl hydrate --dry-run
+```
+
+This reports how many files are already local vs need downloading, without downloading anything.
 
 ## Notes
 
 - Warmup downloads are intentionally conservative because iCloud file downloads are sensitive to aggressive parallelism.
 - The generated systemd unit is created by `./icloudctl`; the repo does not rely on checked-in service files anymore.
 - This project currently targets a user-level systemd service, not a system-wide root service.
+- When `auto_sync: false`, the SIGUSR1 signal triggers a one-shot sync in the background; `icloudctl sync` handles sending that signal and waiting for completion.
