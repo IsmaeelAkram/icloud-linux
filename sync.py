@@ -25,7 +25,7 @@ import time
 
 STATE_DIR = os.path.expanduser("~/.local/state/icloud-linux")
 MARKER_FILE = os.path.join(STATE_DIR, "sync_done")
-DEFAULT_TIMEOUT = 300  # seconds
+DEFAULT_TIMEOUT = 900  # seconds (15 min — iCloud crawl of 19k+ entries takes several minutes)
 
 
 def get_driver_pid():
