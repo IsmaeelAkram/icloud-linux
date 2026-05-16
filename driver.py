@@ -915,6 +915,21 @@ class ICloudSyncEngine:
                 meta = self._node_to_meta(child, child_path)
                 snapshot[meta["remote_drivewsid"]] = meta
                 if meta["type"] == "folder":
+                    # If sync_paths is set, only recurse into folders that are
+                    # on the path to or inside a sync_path. This avoids crawling
+                    # the entire iCloud Drive when only /Downloads is needed.
+                    if self.sync_paths is not None:
+                        should_recurse = False
+                        for sp in self.sync_paths:
+                            sp = sp.rstrip("/")
+                            cp = child_path.rstrip("/")
+                            # Recurse if child is a prefix of sync_path (ancestor)
+                            # or if child is inside sync_path (descendant)
+                            if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
+                                should_recurse = True
+                                break
+                        if not should_recurse:
+                            continue
                     queue.append((child, child_path))
 
             now = time.time()
