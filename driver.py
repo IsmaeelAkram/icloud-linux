@@ -671,6 +671,7 @@ class ICloudSyncEngine:
         remote_refresh_interval_seconds=300,
         warmup_workers=1,
         sync_paths=None,
+        exclude_paths=None,
     ):
         self.api = api
         self.mirror = mirror
@@ -686,6 +687,11 @@ class ICloudSyncEngine:
             self.sync_paths = [p if p.startswith('/') else '/' + p for p in sync_paths]
         else:
             self.sync_paths = None
+        # Normalise exclude_paths: deny-list applied before sync_paths
+        if exclude_paths:
+            self.exclude_paths = [p if p.startswith('/') else '/' + p for p in exclude_paths]
+        else:
+            self.exclude_paths = []
         self.executor = ThreadPoolExecutor(max_workers=self.warmup_workers, thread_name_prefix="warmup")
         self.stop_event = threading.Event()
         self.path_locks = {}
@@ -1418,7 +1424,22 @@ class ICloudSyncEngine:
         )
 
     def _path_allowed(self, path):
-        """Return True if this path should be hydrated/downloaded."""
+        """Return True if this path should be hydrated/downloaded.
+
+        Rules (evaluated in order):
+          1. exclude_paths deny-list — any matching prefix blocks hydration,
+             regardless of sync_paths.  This lets you carve out large
+             subdirectories from an otherwise-allowed sync_path.
+          2. sync_paths allow-list — if set, only matching prefixes are
+             hydrated.  None means allow all (minus exclusions).
+        """
+        # 1. Deny-list check first
+        if self.exclude_paths:
+            for prefix in self.exclude_paths:
+                if path == prefix or path.startswith(prefix + '/'):
+                    return False
+
+        # 2. Allow-list check
         if self.sync_paths is None:
             return True
         for prefix in self.sync_paths:
@@ -1554,6 +1575,7 @@ class ICloudFS(Fuse):
         remote_refresh_interval_seconds,
         warmup_workers,
         sync_paths=None,
+        exclude_paths=None,
     ):
         self.mirror = LocalMirror(cache_dir)
         state_path = os.path.join(cache_dir, "state.sqlite3")
@@ -1575,6 +1597,7 @@ class ICloudFS(Fuse):
             remote_refresh_interval_seconds=remote_refresh_interval_seconds,
             warmup_workers=warmup_workers,
             sync_paths=sync_paths,
+            exclude_paths=exclude_paths,
         )
         self.sync_engine.start()
 
@@ -1980,7 +2003,8 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     upload_interval_seconds = int(config.get("upload_interval_seconds", 30))
     remote_refresh_interval_seconds = int(config.get("remote_refresh_interval_seconds", 300))
     warmup_workers = int(config.get("warmup_workers", 1))
-    sync_paths = config.get("sync_paths", None)  # list of iCloud paths to hydrate, None=all
+    sync_paths = config.get("sync_paths", None)      # list of iCloud paths to hydrate, None=all
+    exclude_paths = config.get("exclude_paths", None) # deny-list applied before sync_paths
 
     # When running under systemd (no TTY) we never want a failed auth to crash
     # the process — that would trigger Restart=on-failure and hammer Apple's
@@ -1996,6 +2020,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         remote_refresh_interval_seconds,
         warmup_workers,
         sync_paths=sync_paths,
+        exclude_paths=exclude_paths,
     )
 
     atexit.register(fs.shutdown)
