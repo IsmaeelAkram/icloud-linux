@@ -1456,7 +1456,15 @@ class ICloudFS(Fuse):
         if self.sync_engine is not None:
             self.sync_engine.shutdown()
 
-    def init_icloud(self, username, password, cache_dir, cookie_dir=None):
+    def init_icloud(self, username, password, cache_dir, cookie_dir=None, require_session=True):
+        """Initialise iCloud API connection.
+
+        If *require_session* is False (the default when called from the systemd
+        service path), an auth failure sets self.api = None and logs a clear
+        error rather than crashing the process.  The FUSE layer will return
+        EACCES for all operations until a session is restored via
+        './icloudctl auth' followed by './icloudctl restart'.
+        """
         self.username = username
         self.password = password
         self.cache_dir = cache_dir
@@ -1513,9 +1521,23 @@ class ICloudFS(Fuse):
 
             if self.api.requires_2fa or self.api.requires_2sa:
                 raise RuntimeError("Additional authentication still required after code verification.")
+
         except Exception as exc:
             self.logger.error("Failed to connect to iCloud: %s", exc)
-            raise
+            if require_session:
+                raise
+            # Non-fatal path: park in unauthenticated state.  The FUSE layer
+            # will return EACCES for all operations; the service stays up and
+            # won't trigger Apple's lockout by crash-looping.
+            self.logger.error(
+                "Service starting in UNAUTHENTICATED mode.  "
+                "Run './icloudctl auth' then './icloudctl restart' to restore access."
+            )
+            self.api = None
+
+    def _is_authenticated(self):
+        """Return True if a live iCloud session is available."""
+        return self.api is not None
 
     def init_local_cache(
         self,
@@ -1530,6 +1552,12 @@ class ICloudFS(Fuse):
         self.mirror = LocalMirror(cache_dir)
         state_path = os.path.join(cache_dir, "state.sqlite3")
         self.state = SyncState(state_path)
+        if not self._is_authenticated():
+            self.logger.warning(
+                "Skipping sync engine start — no iCloud session.  "
+                "FUSE will serve cached data read-only until re-authenticated."
+            )
+            return
         self.sync_engine = ICloudSyncEngine(
             self.api,
             self.mirror,
@@ -1605,6 +1633,14 @@ class ICloudFS(Fuse):
 
         entry = self.state.get_entry(path)
         if entry and entry["type"] == "file" and not entry["hydrated"] and not entry["dirty"]:
+            if not self._is_authenticated() or self.sync_engine is None:
+                # No session: serve what we have locally; remote files return EIO
+                if not self.mirror.exists(path):
+                    self.logger.warning(
+                        "Cannot hydrate %s: no iCloud session. Run './icloudctl auth' then restart.", path
+                    )
+                    return -errno.EIO
+                return 0
             try:
                 self.sync_engine.ensure_local_file(path)
             except Exception as exc:
@@ -1613,6 +1649,8 @@ class ICloudFS(Fuse):
         return 0
 
     def create(self, path, mode, flags=None):
+        if not self._is_authenticated():
+            return -errno.EACCES
         try:
             self.mirror.create_file(path)
             stats = self.mirror.stat_local(path)
@@ -1643,6 +1681,12 @@ class ICloudFS(Fuse):
 
         try:
             if not entry["hydrated"] and not entry["dirty"]:
+                if self.sync_engine is None:
+                    # No session — cannot hydrate; if placeholder exists it has no data
+                    self.logger.warning(
+                        "Cannot hydrate %s: no iCloud session. Run './icloudctl auth' then restart.", path
+                    )
+                    return -errno.EIO
                 self.sync_engine.ensure_local_file(path)
             self._log_file_op("read", path, level=logging.DEBUG, size=size, offset=offset)
             return self.mirror.read(path, size, offset)
@@ -1651,6 +1695,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def write(self, path, buf, offset):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
             try:
@@ -1694,6 +1740,8 @@ class ICloudFS(Fuse):
         return 0
 
     def mkdir(self, path, mode):
+        if not self._is_authenticated():
+            return -errno.EACCES
         try:
             self.mirror.ensure_dir(path)
             stats = self.mirror.stat_local(path)
@@ -1718,6 +1766,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def rmdir(self, path):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if not entry:
             return -errno.ENOENT
@@ -1738,6 +1788,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def unlink(self, path):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if not entry:
             return -errno.ENOENT
@@ -1759,6 +1811,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def rename(self, oldpath, newpath):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(oldpath)
         if not entry:
             return -errno.ENOENT
@@ -1782,6 +1836,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def truncate(self, path, length):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
             try:
@@ -1920,7 +1976,12 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     warmup_workers = int(config.get("warmup_workers", 1))
     sync_paths = config.get("sync_paths", None)  # list of iCloud paths to hydrate, None=all
 
-    fs.init_icloud(username, password, cache_dir, cookie_dir)
+    # When running under systemd (no TTY) we never want a failed auth to crash
+    # the process — that would trigger Restart=on-failure and hammer Apple's
+    # lockout threshold.  require_session=True is still the right default for
+    # interactive invocations (e.g. debugging from a terminal with -f).
+    interactive = sys.stdin.isatty()
+    fs.init_icloud(username, password, cache_dir, cookie_dir, require_session=interactive)
     fs.init_local_cache(
         cache_dir,
         warmup_mode,

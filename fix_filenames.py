@@ -134,19 +134,32 @@ def main():
             new_dpath = os.path.join(dirpath, new_dname)
             old_db = mirror_to_icloud_path(old_dpath)
             new_db = mirror_to_icloud_path(new_dpath)
+            old_prefix = old_db.rstrip('/') + '/'
+            new_prefix = new_db.rstrip('/') + '/'
             print(f'  DIR OLD: {dname}')
             print(f'  DIR NEW: {new_dname}')
             if not args.dry_run:
                 try:
                     os.rename(old_dpath, new_dpath)
-                    # Update all entries under this dir
+                    # Update the directory entry itself
                     cur.execute(
-                        "UPDATE entries SET path = replace(path, ?, ?), "
-                        "parent_path = replace(parent_path, ?, ?) "
-                        "WHERE path LIKE ? OR path = ?",
-                        (old_db + '/', new_db + '/',
-                         old_db + '/', new_db + '/',
-                         old_db + '/%', old_db)
+                        "UPDATE entries SET path = ?, parent_path = ? WHERE path = ?",
+                        (new_db, os.path.dirname(new_db) or '/', old_db)
+                    )
+                    # Update all children using a safe prefix match.
+                    # We use SUBSTR to avoid clobbering sibling paths that
+                    # share a common prefix (the bug in the old replace() approach).
+                    prefix_len = len(old_prefix)
+                    cur.execute(
+                        """
+                        UPDATE entries
+                        SET path        = ? || SUBSTR(path,        ?),
+                            parent_path = ? || SUBSTR(parent_path, ?)
+                        WHERE path LIKE ?
+                        """,
+                        (new_prefix, prefix_len + 1,
+                         new_prefix, prefix_len + 1,
+                         old_prefix + '%')
                     )
                     db.commit()
                     print(f'  -> DIR OK')

@@ -157,7 +157,7 @@ EOF
 cmd_auth() {
   ensure_venv
   create_config_if_missing
-  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/auth.py" "$CONFIG_FILE"
+  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/auth.py" "$CONFIG_FILE" "$@"
 }
 
 cmd_start() { cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
@@ -241,7 +241,10 @@ Commands:
   quickstart [mount_dir]   One-command guided setup
   init [mount_dir]         Initialize venv/config/service files
   configure [email]        Write config.yaml with credentials
-  auth                     Run interactive 2FA bootstrap
+  auth [--force-sms] [--debug] [--trust-token TOKEN]
+                           Run interactive 2FA bootstrap.
+                           --force-sms bypasses push delivery (iOS 26 beta workaround)
+                           --debug prints Apple's reported auth mode for diagnosis
   clear-cache              Remove local mirror/state and rebuild on next start
   start|stop|restart       Service control
   status                   Show service status
@@ -258,7 +261,7 @@ main() {
     quickstart) cmd_quickstart "$@" ;;
     init) cmd_init "$@" ;;
     configure) cmd_configure "$@" ;;
-    auth) cmd_auth ;;
+    auth) cmd_auth "$@" ;;
     clear-cache) cmd_clear_cache ;;
     start) cmd_start ;;
     stop) cmd_stop ;;
