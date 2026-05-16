@@ -2037,6 +2037,51 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     # lockout threshold.  require_session=True is still the right default for
     # interactive invocations (e.g. debugging from a terminal with -f).
     interactive = sys.stdin.isatty()
+
+    # Register signal handlers BEFORE init_local_cache() so they are live
+    # during the reconcile pass (~75s).  Without this, SIGUSR1 arriving during
+    # reconcile uses Python's default handler which kills the process.
+    atexit.register(fs.shutdown)
+
+    def handle_shutdown(signum, frame):
+        logger.info("Received signal %s, shutting down background sync", signum)
+        fs.shutdown()
+        raise SystemExit(0)
+
+    # SIGUSR1 — on-demand sync trigger (used by 'icloudctl sync')
+    # Queues a one-shot remote crawl in a background thread so the signal
+    # handler returns immediately and FUSE keeps serving requests.
+    # If sync_engine is not ready yet (still reconciling), queues it to run
+    # once the engine is available.
+    def handle_sigusr1(signum, frame):
+        def _one_shot():
+            # Wait up to 120s for the sync engine to be ready after startup
+            deadline = time.time() + 120
+            while fs.sync_engine is None and time.time() < deadline:
+                time.sleep(1)
+            if fs.sync_engine is None:
+                logger.warning("SIGUSR1: sync engine not available (unauthenticated or startup failed)")
+                return
+            logger.info("SIGUSR1: starting on-demand sync")
+            try:
+                fs.sync_engine.initial_scan()
+                logger.info("SIGUSR1: on-demand sync complete")
+            except Exception as exc:
+                logger.error("SIGUSR1: on-demand sync failed: %s", exc)
+            finally:
+                # Write completion marker so icloudctl sync can detect done.
+                state_dir = os.path.expanduser("~/.local/state/icloud-linux")
+                os.makedirs(state_dir, exist_ok=True)
+                marker = os.path.join(state_dir, "sync_done")
+                with open(marker, "w") as fh:
+                    fh.write(str(time.time()))
+
+        threading.Thread(target=_one_shot, name="icloud-on-demand-sync", daemon=True).start()
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
+
     fs.init_icloud(username, password, cache_dir, cookie_dir, require_session=interactive)
     fs.init_local_cache(
         cache_dir,
@@ -2049,42 +2094,6 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         exclude_paths=exclude_paths,
         auto_sync=auto_sync,
     )
-
-    atexit.register(fs.shutdown)
-
-    def handle_shutdown(signum, frame):
-        logger.info("Received signal %s, shutting down background sync", signum)
-        fs.shutdown()
-        raise SystemExit(0)
-
-    # SIGUSR1 — on-demand sync trigger (used by 'icloudctl sync')
-    # Runs a one-shot remote crawl + upload pass in a background thread so the
-    # signal handler returns immediately and FUSE keeps serving requests.
-    def handle_sigusr1(signum, frame):
-        if fs.sync_engine is None:
-            logger.warning("SIGUSR1: sync engine not running (unauthenticated?)")
-            return
-        logger.info("SIGUSR1: starting on-demand sync")
-
-        def _one_shot():
-            try:
-                fs.sync_engine.initial_scan()
-                logger.info("SIGUSR1: on-demand sync complete")
-            except Exception as exc:
-                logger.error("SIGUSR1: on-demand sync failed: %s", exc)
-            finally:
-                # Write a completion marker so icloudctl sync can detect done.
-                state_dir = os.path.expanduser("~/.local/state/icloud-linux")
-                os.makedirs(state_dir, exist_ok=True)
-                marker = os.path.join(state_dir, "sync_done")
-                with open(marker, "w") as fh:
-                    fh.write(str(time.time()))
-
-        threading.Thread(target=_one_shot, name="icloud-on-demand-sync", daemon=True).start()
-
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGUSR1, handle_sigusr1)
 
     try:
         fs.main()
