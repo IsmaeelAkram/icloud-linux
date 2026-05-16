@@ -43,6 +43,15 @@ cookie_dir: "~/.config/icloud-linux/cookies"
 # exclude_paths:
 #   - /Downloads/Michael Priority
 
+# Auto-sync mode.
+# true (default)  — background threads poll iCloud on upload_interval_seconds
+#                   and remote_refresh_interval_seconds schedules automatically.
+# false           — background threads are NOT started.  The driver mounts and
+#                   waits; run 'icloudctl sync' to pull the latest remote
+#                   changes on demand.  Good for low-churn libraries where
+#                   constant polling is wasteful.
+auto_sync: true
+
 # FUSE options
 fuse_options:
   allow_other: false  # Set to true to allow other users to access the mount

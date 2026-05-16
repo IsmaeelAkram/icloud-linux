@@ -672,6 +672,7 @@ class ICloudSyncEngine:
         warmup_workers=1,
         sync_paths=None,
         exclude_paths=None,
+        auto_sync=True,
     ):
         self.api = api
         self.mirror = mirror
@@ -682,6 +683,7 @@ class ICloudSyncEngine:
         self.upload_interval_seconds = upload_interval_seconds
         self.remote_refresh_interval_seconds = remote_refresh_interval_seconds
         self.warmup_workers = max(1, int(warmup_workers))
+        self.auto_sync = bool(auto_sync)
         # Normalise sync_paths: list of /-prefixed strings, or None = allow all
         if sync_paths:
             self.sync_paths = [p if p.startswith('/') else '/' + p for p in sync_paths]
@@ -727,7 +729,13 @@ class ICloudSyncEngine:
             self.initial_scan()
             if self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
-        self._start_background_threads()
+        if self.auto_sync:
+            self._start_background_threads()
+        else:
+            self.logger.info(
+                "auto_sync disabled — background upload/refresh threads not started. "
+                "Use 'icloudctl sync' to trigger a one-shot refresh on demand."
+            )
 
     def _start_background_threads(self):
         upload_thread = threading.Thread(target=self._upload_loop, name="icloud-upload", daemon=True)
@@ -1576,6 +1584,7 @@ class ICloudFS(Fuse):
         warmup_workers,
         sync_paths=None,
         exclude_paths=None,
+        auto_sync=True,
     ):
         self.mirror = LocalMirror(cache_dir)
         state_path = os.path.join(cache_dir, "state.sqlite3")
@@ -1598,6 +1607,7 @@ class ICloudFS(Fuse):
             warmup_workers=warmup_workers,
             sync_paths=sync_paths,
             exclude_paths=exclude_paths,
+            auto_sync=auto_sync,
         )
         self.sync_engine.start()
 
@@ -2005,6 +2015,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     warmup_workers = int(config.get("warmup_workers", 1))
     sync_paths = config.get("sync_paths", None)      # list of iCloud paths to hydrate, None=all
     exclude_paths = config.get("exclude_paths", None) # deny-list applied before sync_paths
+    auto_sync = bool(config.get("auto_sync", True))   # False = manual sync only via icloudctl sync
 
     # When running under systemd (no TTY) we never want a failed auth to crash
     # the process — that would trigger Restart=on-failure and hammer Apple's
@@ -2021,6 +2032,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         warmup_workers,
         sync_paths=sync_paths,
         exclude_paths=exclude_paths,
+        auto_sync=auto_sync,
     )
 
     atexit.register(fs.shutdown)
@@ -2030,8 +2042,34 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         fs.shutdown()
         raise SystemExit(0)
 
+    # SIGUSR1 — on-demand sync trigger (used by 'icloudctl sync')
+    # Runs a one-shot remote crawl + upload pass in a background thread so the
+    # signal handler returns immediately and FUSE keeps serving requests.
+    def handle_sigusr1(signum, frame):
+        if fs.sync_engine is None:
+            logger.warning("SIGUSR1: sync engine not running (unauthenticated?)")
+            return
+        logger.info("SIGUSR1: starting on-demand sync")
+
+        def _one_shot():
+            try:
+                fs.sync_engine.initial_scan()
+                logger.info("SIGUSR1: on-demand sync complete")
+            except Exception as exc:
+                logger.error("SIGUSR1: on-demand sync failed: %s", exc)
+            finally:
+                # Write a completion marker so icloudctl sync can detect done.
+                state_dir = os.path.expanduser("~/.local/state/icloud-linux")
+                os.makedirs(state_dir, exist_ok=True)
+                marker = os.path.join(state_dir, "sync_done")
+                with open(marker, "w") as fh:
+                    fh.write(str(time.time()))
+
+        threading.Thread(target=_one_shot, name="icloud-on-demand-sync", daemon=True).start()
+
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
 
     try:
         fs.main()
