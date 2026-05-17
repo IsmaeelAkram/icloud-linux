@@ -29,6 +29,29 @@ warmup_workers: 1
 # Persistent cookie/session directory used after one-time 2FA bootstrap
 cookie_dir: "~/.config/icloud-linux/cookies"
 
+# Paths to exclude from hydration (deny-list, evaluated before sync_paths).
+# Matching paths will have stubs created but file contents will never be
+# downloaded.  Useful for carving large subdirectories out of a sync_path.
+# Comment out or remove to hydrate everything under sync_paths.
+#
+# Example: hydrate all of /Downloads except the huge Michael Priority folder:
+#   sync_paths:
+#     - /Downloads
+#   exclude_paths:
+#     - /Downloads/Michael Priority
+#
+# exclude_paths:
+#   - /Downloads/Michael Priority
+
+# Auto-sync mode.
+# true (default)  — background threads poll iCloud on upload_interval_seconds
+#                   and remote_refresh_interval_seconds schedules automatically.
+# false           — background threads are NOT started.  The driver mounts and
+#                   waits; run 'icloudctl sync' to pull the latest remote
+#                   changes on demand.  Good for low-churn libraries where
+#                   constant polling is wasteful.
+auto_sync: true
+
 # FUSE options
 fuse_options:
   allow_other: false  # Set to true to allow other users to access the mount

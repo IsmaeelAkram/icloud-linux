@@ -157,7 +157,7 @@ EOF
 cmd_auth() {
   ensure_venv
   create_config_if_missing
-  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/auth.py" "$CONFIG_FILE"
+  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/auth.py" "$CONFIG_FILE" "$@"
 }
 
 cmd_start() { cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
@@ -165,6 +165,16 @@ cmd_stop() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; clean
 cmd_restart() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
 cmd_status() { systemctl --user --no-pager status icloud.service; }
 cmd_logs() { journalctl --user -u icloud.service -f; }
+cmd_hydrate() {
+  ensure_venv
+  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/hydrate.py" --config "$CONFIG_FILE" "$@"
+}
+
+cmd_sync() {
+  ensure_venv
+  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/sync.py" "$@"
+}
+
 cmd_clear_cache() {
   local was_active=0
   systemctl --user is-active --quiet icloud.service && was_active=1 || true
@@ -241,7 +251,18 @@ Commands:
   quickstart [mount_dir]   One-command guided setup
   init [mount_dir]         Initialize venv/config/service files
   configure [email]        Write config.yaml with credentials
-  auth                     Run interactive 2FA bootstrap
+  auth [--force-sms] [--debug] [--trust-token TOKEN]
+                           Run interactive 2FA bootstrap.
+                           --force-sms bypasses push delivery (iOS 26 beta workaround)
+                           --debug prints Apple's reported auth mode for diagnosis
+  hydrate [--dry-run] [--verbose]
+                           Block until all eligible files are downloaded locally.
+                           Honors sync_paths and exclude_paths from config.
+                           Use before copy tasks to ensure files are fully local.
+  sync [--timeout SEC] [--quiet]
+                           Trigger an on-demand remote sync in the running driver
+                           (sends SIGUSR1, waits for completion).  Useful when
+                           auto_sync: false is set in config.yaml.
   clear-cache              Remove local mirror/state and rebuild on next start
   start|stop|restart       Service control
   status                   Show service status
@@ -258,7 +279,9 @@ main() {
     quickstart) cmd_quickstart "$@" ;;
     init) cmd_init "$@" ;;
     configure) cmd_configure "$@" ;;
-    auth) cmd_auth ;;
+    auth) cmd_auth "$@" ;;
+    hydrate) cmd_hydrate "$@" ;;
+    sync) cmd_sync "$@" ;;
     clear-cache) cmd_clear_cache ;;
     start) cmd_start ;;
     stop) cmd_stop ;;

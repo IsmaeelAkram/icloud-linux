@@ -670,6 +670,9 @@ class ICloudSyncEngine:
         upload_interval_seconds=30,
         remote_refresh_interval_seconds=300,
         warmup_workers=1,
+        sync_paths=None,
+        exclude_paths=None,
+        auto_sync=True,
     ):
         self.api = api
         self.mirror = mirror
@@ -680,6 +683,17 @@ class ICloudSyncEngine:
         self.upload_interval_seconds = upload_interval_seconds
         self.remote_refresh_interval_seconds = remote_refresh_interval_seconds
         self.warmup_workers = max(1, int(warmup_workers))
+        self.auto_sync = bool(auto_sync)
+        # Normalise sync_paths: list of /-prefixed strings, or None = allow all
+        if sync_paths:
+            self.sync_paths = [p if p.startswith('/') else '/' + p for p in sync_paths]
+        else:
+            self.sync_paths = None
+        # Normalise exclude_paths: deny-list applied before sync_paths
+        if exclude_paths:
+            self.exclude_paths = [p if p.startswith('/') else '/' + p for p in exclude_paths]
+        else:
+            self.exclude_paths = []
         self.executor = ThreadPoolExecutor(max_workers=self.warmup_workers, thread_name_prefix="warmup")
         self.stop_event = threading.Event()
         self.path_locks = {}
@@ -715,7 +729,13 @@ class ICloudSyncEngine:
             self.initial_scan()
             if self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
-        self._start_background_threads()
+        if self.auto_sync:
+            self._start_background_threads()
+        else:
+            self.logger.info(
+                "auto_sync disabled — background upload/refresh threads not started. "
+                "Use 'icloudctl sync' to trigger a one-shot refresh on demand."
+            )
 
     def _start_background_threads(self):
         upload_thread = threading.Thread(target=self._upload_loop, name="icloud-upload", daemon=True)
@@ -770,8 +790,14 @@ class ICloudSyncEngine:
                 checksum = entry.get("local_sha256")
                 hydrated = bool(entry["hydrated"])
                 if entry["type"] == "file" and (hydrated or not entry["remote_drivewsid"]):
-                    checksum = self.mirror.file_sha256(path)
                     hydrated = True
+                    # Only recompute the SHA256 if size or mtime changed since
+                    # the last recorded sync — reading every file on startup is
+                    # the cause of the 4-minute / 11 GB memory blowup at boot.
+                    size_changed = stats.st_size != int(entry.get("size") or 0)
+                    mtime_changed = int(stats.st_mtime) != int(entry.get("mtime") or 0)
+                    if size_changed or mtime_changed or not checksum:
+                        checksum = self.mirror.file_sha256(path)
                 self.state.upsert_entry(
                     {
                         **entry,
@@ -809,6 +835,8 @@ class ICloudSyncEngine:
         )
 
     def ensure_local_file(self, path):
+        if not self._path_allowed(path):
+            return
         entry = self.state.get_entry(path)
         if not entry or entry["type"] != "file" or entry["tombstone"]:
             return
@@ -872,12 +900,20 @@ class ICloudSyncEngine:
         started_at = time.time()
         last_progress_log = started_at
         scanned_folders = 0
+        _crawl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="icloud-crawl")
+        FOLDER_TIMEOUT = 60  # seconds per folder before giving up
 
         while queue:
             node, path = queue.popleft()
             scanned_folders += 1
             try:
-                children = node.get_children(force=True)
+                future = _crawl_executor.submit(node.get_children, True)
+                children = future.result(timeout=FOLDER_TIMEOUT)
+            except TimeoutError:
+                self.logger.warning(
+                    "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
+                )
+                continue
             except Exception as exc:
                 self.logger.error("Failed to enumerate %s: %s", path, exc)
                 continue
@@ -887,6 +923,21 @@ class ICloudSyncEngine:
                 meta = self._node_to_meta(child, child_path)
                 snapshot[meta["remote_drivewsid"]] = meta
                 if meta["type"] == "folder":
+                    # If sync_paths is set, only recurse into folders that are
+                    # on the path to or inside a sync_path. This avoids crawling
+                    # the entire iCloud Drive when only /Downloads is needed.
+                    if self.sync_paths is not None:
+                        should_recurse = False
+                        for sp in self.sync_paths:
+                            sp = sp.rstrip("/")
+                            cp = child_path.rstrip("/")
+                            # Recurse if child is a prefix of sync_path (ancestor)
+                            # or if child is inside sync_path (descendant)
+                            if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
+                                should_recurse = True
+                                break
+                        if not should_recurse:
+                            continue
                     queue.append((child, child_path))
 
             now = time.time()
@@ -1055,6 +1106,8 @@ class ICloudSyncEngine:
         self._schedule_download_with_delay(path, 0)
 
     def _schedule_download_with_delay(self, path, delay_seconds):
+        if not self._path_allowed(path):
+            return
         if self.stop_event.is_set() or self.is_shutdown:
             return
 
@@ -1401,6 +1454,30 @@ class ICloudSyncEngine:
             else dirname.rstrip("/") + "/" + f"{basename}.local-conflict-{stamp}"
         )
 
+    def _path_allowed(self, path):
+        """Return True if this path should be hydrated/downloaded.
+
+        Rules (evaluated in order):
+          1. exclude_paths deny-list — any matching prefix blocks hydration,
+             regardless of sync_paths.  This lets you carve out large
+             subdirectories from an otherwise-allowed sync_path.
+          2. sync_paths allow-list — if set, only matching prefixes are
+             hydrated.  None means allow all (minus exclusions).
+        """
+        # 1. Deny-list check first
+        if self.exclude_paths:
+            for prefix in self.exclude_paths:
+                if path == prefix or path.startswith(prefix + '/'):
+                    return False
+
+        # 2. Allow-list check
+        if self.sync_paths is None:
+            return True
+        for prefix in self.sync_paths:
+            if path == prefix or path.startswith(prefix + '/'):
+                return True
+        return False
+
     def _path_lock(self, path):
         with self.path_locks_lock:
             lock = self.path_locks.get(path)
@@ -1437,7 +1514,15 @@ class ICloudFS(Fuse):
         if self.sync_engine is not None:
             self.sync_engine.shutdown()
 
-    def init_icloud(self, username, password, cache_dir, cookie_dir=None):
+    def init_icloud(self, username, password, cache_dir, cookie_dir=None, require_session=True):
+        """Initialise iCloud API connection.
+
+        If *require_session* is False (the default when called from the systemd
+        service path), an auth failure sets self.api = None and logs a clear
+        error rather than crashing the process.  The FUSE layer will return
+        EACCES for all operations until a session is restored via
+        './icloudctl auth' followed by './icloudctl restart'.
+        """
         self.username = username
         self.password = password
         self.cache_dir = cache_dir
@@ -1446,7 +1531,19 @@ class ICloudFS(Fuse):
             os.makedirs(cookie_dir, exist_ok=True)
 
         try:
-            self.api = PyiCloudService(username, password, cookie_directory=cookie_dir)
+            # Resolve Apple account partition (fixes 421 redirect for non-default shards)
+            import requests as _req
+            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={})
+            _partition = _r.headers.get("x-apple-user-partition")
+
+            self.api = PyiCloudService(username, password,
+                                       cookie_directory=cookie_dir,
+                                       authenticate=False)
+            if _partition:
+                self.api._setup_endpoint = (
+                    f"https://p{_partition}-setup.icloud.com/setup/ws/1"
+                )
+            self.api.authenticate()
             if self.api.requires_2fa:
                 if sys.stdin.isatty():
                     print("Two-factor authentication required.")
@@ -1482,9 +1579,23 @@ class ICloudFS(Fuse):
 
             if self.api.requires_2fa or self.api.requires_2sa:
                 raise RuntimeError("Additional authentication still required after code verification.")
+
         except Exception as exc:
             self.logger.error("Failed to connect to iCloud: %s", exc)
-            raise
+            if require_session:
+                raise
+            # Non-fatal path: park in unauthenticated state.  The FUSE layer
+            # will return EACCES for all operations; the service stays up and
+            # won't trigger Apple's lockout by crash-looping.
+            self.logger.error(
+                "Service starting in UNAUTHENTICATED mode.  "
+                "Run './icloudctl auth' then './icloudctl restart' to restore access."
+            )
+            self.api = None
+
+    def _is_authenticated(self):
+        """Return True if a live iCloud session is available."""
+        return self.api is not None
 
     def init_local_cache(
         self,
@@ -1494,10 +1605,19 @@ class ICloudFS(Fuse):
         upload_interval_seconds,
         remote_refresh_interval_seconds,
         warmup_workers,
+        sync_paths=None,
+        exclude_paths=None,
+        auto_sync=True,
     ):
         self.mirror = LocalMirror(cache_dir)
         state_path = os.path.join(cache_dir, "state.sqlite3")
         self.state = SyncState(state_path)
+        if not self._is_authenticated():
+            self.logger.warning(
+                "Skipping sync engine start — no iCloud session.  "
+                "FUSE will serve cached data read-only until re-authenticated."
+            )
+            return
         self.sync_engine = ICloudSyncEngine(
             self.api,
             self.mirror,
@@ -1508,6 +1628,9 @@ class ICloudFS(Fuse):
             upload_interval_seconds=upload_interval_seconds,
             remote_refresh_interval_seconds=remote_refresh_interval_seconds,
             warmup_workers=warmup_workers,
+            sync_paths=sync_paths,
+            exclude_paths=exclude_paths,
+            auto_sync=auto_sync,
         )
         self.sync_engine.start()
 
@@ -1572,6 +1695,14 @@ class ICloudFS(Fuse):
 
         entry = self.state.get_entry(path)
         if entry and entry["type"] == "file" and not entry["hydrated"] and not entry["dirty"]:
+            if not self._is_authenticated() or self.sync_engine is None:
+                # No session: serve what we have locally; remote files return EIO
+                if not self.mirror.exists(path):
+                    self.logger.warning(
+                        "Cannot hydrate %s: no iCloud session. Run './icloudctl auth' then restart.", path
+                    )
+                    return -errno.EIO
+                return 0
             try:
                 self.sync_engine.ensure_local_file(path)
             except Exception as exc:
@@ -1580,6 +1711,8 @@ class ICloudFS(Fuse):
         return 0
 
     def create(self, path, mode, flags=None):
+        if not self._is_authenticated():
+            return -errno.EACCES
         try:
             self.mirror.create_file(path)
             stats = self.mirror.stat_local(path)
@@ -1610,6 +1743,12 @@ class ICloudFS(Fuse):
 
         try:
             if not entry["hydrated"] and not entry["dirty"]:
+                if self.sync_engine is None:
+                    # No session — cannot hydrate; if placeholder exists it has no data
+                    self.logger.warning(
+                        "Cannot hydrate %s: no iCloud session. Run './icloudctl auth' then restart.", path
+                    )
+                    return -errno.EIO
                 self.sync_engine.ensure_local_file(path)
             self._log_file_op("read", path, level=logging.DEBUG, size=size, offset=offset)
             return self.mirror.read(path, size, offset)
@@ -1618,6 +1757,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def write(self, path, buf, offset):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
             try:
@@ -1661,6 +1802,8 @@ class ICloudFS(Fuse):
         return 0
 
     def mkdir(self, path, mode):
+        if not self._is_authenticated():
+            return -errno.EACCES
         try:
             self.mirror.ensure_dir(path)
             stats = self.mirror.stat_local(path)
@@ -1685,6 +1828,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def rmdir(self, path):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if not entry:
             return -errno.ENOENT
@@ -1705,6 +1850,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def unlink(self, path):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if not entry:
             return -errno.ENOENT
@@ -1726,6 +1873,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def rename(self, oldpath, newpath):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(oldpath)
         if not entry:
             return -errno.ENOENT
@@ -1749,6 +1898,8 @@ class ICloudFS(Fuse):
             return -errno.EIO
 
     def truncate(self, path, length):
+        if not self._is_authenticated():
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
             try:
@@ -1885,17 +2036,19 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     upload_interval_seconds = int(config.get("upload_interval_seconds", 30))
     remote_refresh_interval_seconds = int(config.get("remote_refresh_interval_seconds", 300))
     warmup_workers = int(config.get("warmup_workers", 1))
+    sync_paths = config.get("sync_paths", None)      # list of iCloud paths to hydrate, None=all
+    exclude_paths = config.get("exclude_paths", None) # deny-list applied before sync_paths
+    auto_sync = bool(config.get("auto_sync", True))   # False = manual sync only via icloudctl sync
 
-    fs.init_icloud(username, password, cache_dir, cookie_dir)
-    fs.init_local_cache(
-        cache_dir,
-        warmup_mode,
-        conflict_mode,
-        upload_interval_seconds,
-        remote_refresh_interval_seconds,
-        warmup_workers,
-    )
+    # When running under systemd (no TTY) we never want a failed auth to crash
+    # the process — that would trigger Restart=on-failure and hammer Apple's
+    # lockout threshold.  require_session=True is still the right default for
+    # interactive invocations (e.g. debugging from a terminal with -f).
+    interactive = sys.stdin.isatty()
 
+    # Register signal handlers BEFORE init_local_cache() so they are live
+    # during the reconcile pass (~75s).  Without this, SIGUSR1 arriving during
+    # reconcile uses Python's default handler which kills the process.
     atexit.register(fs.shutdown)
 
     def handle_shutdown(signum, frame):
@@ -1903,8 +2056,52 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         fs.shutdown()
         raise SystemExit(0)
 
+    # SIGUSR1 — on-demand sync trigger (used by 'icloudctl sync')
+    # Queues a one-shot remote crawl in a background thread so the signal
+    # handler returns immediately and FUSE keeps serving requests.
+    # If sync_engine is not ready yet (still reconciling), queues it to run
+    # once the engine is available.
+    def handle_sigusr1(signum, frame):
+        def _one_shot():
+            # Wait up to 120s for the sync engine to be ready after startup
+            deadline = time.time() + 120
+            while fs.sync_engine is None and time.time() < deadline:
+                time.sleep(1)
+            if fs.sync_engine is None:
+                logger.warning("SIGUSR1: sync engine not available (unauthenticated or startup failed)")
+                return
+            logger.info("SIGUSR1: starting on-demand sync")
+            try:
+                fs.sync_engine.initial_scan()
+                logger.info("SIGUSR1: on-demand sync complete")
+            except Exception as exc:
+                logger.error("SIGUSR1: on-demand sync failed: %s", exc)
+            finally:
+                # Write completion marker so icloudctl sync can detect done.
+                state_dir = os.path.expanduser("~/.local/state/icloud-linux")
+                os.makedirs(state_dir, exist_ok=True)
+                marker = os.path.join(state_dir, "sync_done")
+                with open(marker, "w") as fh:
+                    fh.write(str(time.time()))
+
+        threading.Thread(target=_one_shot, name="icloud-on-demand-sync", daemon=True).start()
+
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
+
+    fs.init_icloud(username, password, cache_dir, cookie_dir, require_session=interactive)
+    fs.init_local_cache(
+        cache_dir,
+        warmup_mode,
+        conflict_mode,
+        upload_interval_seconds,
+        remote_refresh_interval_seconds,
+        warmup_workers,
+        sync_paths=sync_paths,
+        exclude_paths=exclude_paths,
+        auto_sync=auto_sync,
+    )
 
     try:
         fs.main()
