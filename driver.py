@@ -900,12 +900,20 @@ class ICloudSyncEngine:
         started_at = time.time()
         last_progress_log = started_at
         scanned_folders = 0
+        _crawl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="icloud-crawl")
+        FOLDER_TIMEOUT = 60  # seconds per folder before giving up
 
         while queue:
             node, path = queue.popleft()
             scanned_folders += 1
             try:
-                children = node.get_children(force=True)
+                future = _crawl_executor.submit(node.get_children, True)
+                children = future.result(timeout=FOLDER_TIMEOUT)
+            except TimeoutError:
+                self.logger.warning(
+                    "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
+                )
+                continue
             except Exception as exc:
                 self.logger.error("Failed to enumerate %s: %s", path, exc)
                 continue
