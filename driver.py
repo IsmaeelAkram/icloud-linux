@@ -1595,7 +1595,7 @@ class ICloudFS(Fuse):
         try:
             # Resolve Apple account partition (fixes 421 redirect for non-default shards)
             import requests as _req
-            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={})
+            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={}, timeout=10)
             _partition = _r.headers.get("x-apple-user-partition")
 
             self.api = PyiCloudService(username, password,
@@ -1658,6 +1658,10 @@ class ICloudFS(Fuse):
     def _is_authenticated(self):
         """Return True if a live iCloud session is available."""
         return self.api is not None
+
+    def _is_directory_type(self, entry_type):
+        """Return True for directory-like entry types, even in offline mode."""
+        return entry_type in DIRECTORY_NODE_TYPES
 
     def init_local_cache(
         self,
@@ -1726,7 +1730,7 @@ class ICloudFS(Fuse):
             return attrs
 
         if entry and not entry["tombstone"]:
-            is_directory = self.sync_engine._is_directory_type(entry["type"])
+            is_directory = self._is_directory_type(entry["type"])
             attrs.st_mode = (stat.S_IFDIR | 0o755) if is_directory else (stat.S_IFREG | 0o644)
             attrs.st_nlink = 2 if is_directory else 1
             attrs.st_size = entry["size"]
