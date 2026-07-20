@@ -1,12 +1,14 @@
+import errno
 import io
 import os
 import shutil
 import sqlite3
+import stat
 import tempfile
 import unittest
 from unittest.mock import Mock
 
-from driver import ICloudSyncEngine, LocalMirror, SyncState
+from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
 
@@ -499,6 +501,139 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(upload_state["class_name"], "NamedFileStream")
         self.assertEqual(upload_state["name"], "a.txt")
         self.assertEqual(upload_state["prefix"], b"hello")
+
+
+class ICloudFSPathPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.api = Mock()
+        self.api.drive.root = Mock()
+        self.engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            Mock(),
+            sync_paths=["/allowed/"],
+            exclude_paths=["/allowed/excluded/"],
+        )
+        self.fs = ICloudFS.__new__(ICloudFS)
+        self.fs.logger = Mock()
+        self.fs.api = self.api
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+        self.fs.sync_engine = self.engine
+
+    def tearDown(self):
+        self.engine.shutdown()
+        shutil.rmtree(self.root)
+
+    def _add_entry(self, path, entry_type="file", content=b"existing"):
+        if entry_type == "folder":
+            self.mirror.ensure_dir(path)
+        else:
+            self.mirror.write(path, content, 0)
+        stats = self.mirror.stat_local(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": entry_type,
+                "parent_path": os.path.dirname(path) or "/",
+                "remote_drivewsid": f"remote-{path}",
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+
+    def _pending_op_count(self):
+        return self.state.conn.execute("SELECT COUNT(*) FROM pending_ops").fetchone()[0]
+
+    def test_allowed_mutations_are_accepted(self):
+        self.assertEqual(self.fs.create("/allowed/queued.txt", 0o644), 0)
+        self.assertEqual(self.fs.mkdir("/allowed/newdir", 0o755), 0)
+        self.assertEqual(self.fs.create("/allowed/newdir/file.txt", 0o644), 0)
+        self.assertEqual(self.fs.write("/allowed/newdir/file.txt", b"hello", 0), 5)
+        self.assertEqual(self.fs.truncate("/allowed/newdir/file.txt", 2), 0)
+        self.assertEqual(
+            self.fs.rename("/allowed/newdir/file.txt", "/allowed/newdir/renamed.txt"),
+            0,
+        )
+        self.assertEqual(self.fs.unlink("/allowed/newdir/renamed.txt"), 0)
+        self.assertEqual(self.fs.rmdir("/allowed/newdir"), 0)
+        self.assertGreater(self._pending_op_count(), 0)
+
+    def test_excluded_and_out_of_scope_mutations_are_rejected_without_queueing(self):
+        self._add_entry("/allowed/source.txt")
+        self._add_entry("/allowed/excluded/file.txt")
+        self._add_entry("/outside/file.txt")
+        self._add_entry("/outside/dir", entry_type="folder")
+
+        entry_paths_before = [entry["path"] for entry in self.state.list_entries()]
+
+        attempts = [
+            self.fs.create("/allowed/excluded/new.txt", 0o644),
+            self.fs.write("/outside/file.txt", b"changed", 0),
+            self.fs.truncate("/allowed/excluded/file.txt", 0),
+            self.fs.mkdir("/outside/newdir", 0o755),
+            self.fs.unlink("/allowed/excluded/file.txt"),
+            self.fs.rmdir("/outside/dir"),
+            self.fs.rename("/allowed/source.txt", "/outside/destination.txt"),
+            self.fs.rename("/outside/file.txt", "/allowed/destination.txt"),
+            self.fs.open("/outside/file.txt", os.O_WRONLY),
+            self.fs.mknod("/outside/node.txt", stat.S_IFREG | 0o644, 0),
+            self.fs.utime("/outside/file.txt", None),
+        ]
+
+        self.assertEqual(attempts, [-errno.EACCES] * len(attempts))
+        self.assertEqual(self._pending_op_count(), 0)
+        self.assertEqual(
+            [entry["path"] for entry in self.state.list_entries()],
+            entry_paths_before,
+        )
+        self.assertEqual(self.mirror.read("/outside/file.txt", 100, 0), b"existing")
+        self.assertTrue(self.mirror.exists("/allowed/source.txt"))
+        self.assertFalse(self.mirror.exists("/outside/destination.txt"))
+
+    def test_uploader_skips_disallowed_dirty_entries(self):
+        self._add_entry("/allowed/file.txt")
+        self._add_entry("/allowed/excluded/file.txt")
+        self._add_entry("/outside/file.txt")
+        self._add_entry("/allowed/moved.txt")
+        self.state.mark_dirty("/allowed/file.txt")
+        self.state.mark_dirty("/allowed/excluded/file.txt")
+        self.state.mark_dirty("/outside/file.txt")
+        self.state.upsert_entry(
+            {
+                **self.state.get_entry("/allowed/moved.txt"),
+                "dirty": True,
+                "synced_path": "/outside/original.txt",
+            }
+        )
+        self.engine._sync_file = Mock()
+
+        self.engine.sync_dirty_entries()
+
+        self.engine._sync_file.assert_called_once_with(
+            self.state.get_entry("/allowed/file.txt")
+        )
+
+    def test_empty_sync_paths_preserve_unrestricted_behavior(self):
+        engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            Mock(),
+            sync_paths=[],
+        )
+        try:
+            self.assertTrue(engine._path_allowed("/outside/file.txt"))
+        finally:
+            engine.shutdown()
 
 
 if __name__ == "__main__":

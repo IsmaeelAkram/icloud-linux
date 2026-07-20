@@ -29,10 +29,10 @@ warmup_workers: 1
 # Persistent cookie/session directory used after one-time 2FA bootstrap
 cookie_dir: "~/.config/icloud-linux/cookies"
 
-# Paths to exclude from hydration (deny-list, evaluated before sync_paths).
-# Matching paths will have stubs created but file contents will never be
-# downloaded.  Useful for carving large subdirectories out of a sync_path.
-# Comment out or remove to hydrate everything under sync_paths.
+# Paths to exclude from hydration and synchronization (deny-list, evaluated
+# before sync_paths). Matching paths will have stubs created but file contents
+# will never be downloaded, uploaded, renamed, or deleted through the mount.
+# Useful for carving large subdirectories out of a sync_path.
 #
 # Example: hydrate all of /Downloads except the huge Michael Priority folder:
 #   sync_paths:
@@ -42,6 +42,14 @@ cookie_dir: "~/.config/icloud-linux/cookies"
 #
 # exclude_paths:
 #   - /Downloads/Michael Priority
+
+# Paths to include in the synchronization boundary (allow-list). When set,
+# only matching paths may be hydrated or mutated through the mount; attempts
+# to create, write, rename, or delete anything else fail with EACCES. Omit or
+# leave empty to retain unrestricted behavior.
+#
+# sync_paths:
+#   - /Downloads
 
 # Auto-sync mode.
 # true (default)  — background threads poll iCloud on upload_interval_seconds
