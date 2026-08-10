@@ -3,6 +3,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock
 
@@ -290,6 +291,37 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine._reconcile_persistent_cache.assert_called_once()
         self.engine._schedule_all_unhydrated.assert_called_once()
         self.engine._start_background_threads.assert_called_once()
+
+    def test_shutdown_is_reentrant_for_signal_handler(self):
+        # A SIGTERM arriving while shutdown() is already running re-enters it on
+        # the same thread, because Python runs signal handlers on the main
+        # thread. Simulate that by re-entering from inside the thread join loop.
+        reentered = []
+
+        def rejoin(timeout=None):
+            if not reentered:
+                reentered.append(True)
+                self.engine.shutdown()
+
+        worker = Mock()
+        worker.join = rejoin
+        self.engine.threads = [worker]
+
+        finished = threading.Event()
+
+        def run_shutdown():
+            self.engine.shutdown()
+            finished.set()
+
+        thread = threading.Thread(target=run_shutdown, daemon=True)
+        thread.start()
+        thread.join(timeout=10)
+
+        self.assertTrue(
+            finished.is_set(),
+            "shutdown() deadlocked when re-entered on the same thread",
+        )
+        self.assertTrue(reentered)
 
     def test_start_performs_initial_scan_on_first_run(self):
         self.engine.start()

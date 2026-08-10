@@ -735,7 +735,12 @@ class ICloudSyncEngine:
         self.hydration_total = 0
         self.hydration_completed = 0
         self.hydration_progress_lock = threading.Lock()
-        self.shutdown_lock = threading.Lock()
+        # Reentrant: shutdown() runs on the main thread from three places (the
+        # finally: after fs.main(), the atexit hook, and the SIGTERM/SIGINT
+        # handler). Python runs signal handlers on the main thread, so a signal
+        # arriving while shutdown() is already in progress re-enters it. With a
+        # plain Lock that self-deadlocks against a frame that can never resume.
+        self.shutdown_lock = threading.RLock()
         self.is_shutdown = False
         # PyiCloud downloads appear sensitive to concurrent use of one session.
         self.download_semaphore = threading.Semaphore(1)
