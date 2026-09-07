@@ -94,6 +94,15 @@ class NamedFileStream:
         self._handle = handle
         self.name = name
 
+    # Defined explicitly (not via __getattr__) so the object satisfies
+    # requests' `isinstance(fp, _SupportsRead)` check. That check is a
+    # runtime_checkable Protocol, which on Python 3.12+ inspects the class
+    # rather than __getattr__; without a real method requests treats the
+    # stream as raw data and the upload fails with "a bytes-like object is
+    # required, not 'NamedFileStream'".
+    def read(self, *args, **kwargs):
+        return self._handle.read(*args, **kwargs)
+
     def __getattr__(self, attr):
         return getattr(self._handle, attr)
 
