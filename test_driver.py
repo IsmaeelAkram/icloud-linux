@@ -383,6 +383,60 @@ class RemoteSnapshotRaceTests(unittest.TestCase):
         self.assertFalse(self.mirror.exists("/old.txt"))
 
 
+class PermissionCallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.mirror.write("/copied.txt", b"content", 0)
+        stats = self.mirror.stat_local("/copied.txt")
+        self.state.upsert_entry(
+            {
+                "path": "/copied.txt",
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": None,
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": None,
+            }
+        )
+        self.fs = ICloudFS.__new__(ICloudFS)
+        self.fs.logger = Mock()
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+
+    def tearDown(self):
+        self.state.conn.close()
+        shutil.rmtree(self.root)
+
+    def test_permission_callbacks_are_safe_noops_for_existing_entries(self):
+        pending_before = self.state.conn.execute(
+            "SELECT COUNT(*) FROM pending_ops"
+        ).fetchone()[0]
+
+        self.assertEqual(self.fs.chmod("/copied.txt", 0o600), 0)
+        self.assertEqual(self.fs.chown("/copied.txt", os.getuid(), os.getgid()), 0)
+
+        entry = self.state.get_entry("/copied.txt")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["dirty"] if entry else None, 0)
+        pending_after = self.state.conn.execute(
+            "SELECT COUNT(*) FROM pending_ops"
+        ).fetchone()[0]
+        self.assertEqual(pending_after, pending_before)
+
+    def test_permission_callbacks_reject_missing_paths(self):
+        self.assertEqual(self.fs.chmod("/missing.txt", 0o600), -errno.ENOENT)
+        self.assertEqual(
+            self.fs.chown("/missing.txt", os.getuid(), os.getgid()),
+            -errno.ENOENT,
+        )
+
+
 class SyncEngineStartupTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")

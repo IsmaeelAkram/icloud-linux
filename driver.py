@@ -2036,6 +2036,20 @@ class ICloudFS(Fuse):
             self.logger.error("Error setting utime for %s: %s", path, exc)
             return -errno.EIO
 
+    def chmod(self, path, mode):
+        """Accept Unix mode updates that iCloud Drive cannot persist."""
+        if self.state is None or self.state.get_entry(path) is None:
+            return -errno.ENOENT
+        self._log_file_op("chmod", path, mode=oct(mode), ignored=True)
+        return 0
+
+    def chown(self, path, uid, gid):
+        """Accept Unix ownership updates that iCloud Drive cannot persist."""
+        if self.state is None or self.state.get_entry(path) is None:
+            return -errno.ENOENT
+        self._log_file_op("chown", path, uid=uid, gid=gid, ignored=True)
+        return 0
+
     def statfs(self):
         stats = self.mirror.statvfs()
         return {
