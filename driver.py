@@ -1980,9 +1980,23 @@ class ICloudFS(Fuse):
             return -errno.EACCES
         if not self._mutation_allowed("rename", oldpath, newpath):
             return -errno.EACCES
-        entry = self.state.get_entry(oldpath)
+        sync_engine = self.sync_engine
+        state = self.state
+        if sync_engine is None or state is None:
+            return -errno.EACCES
+        entry = state.get_entry(oldpath)
         if not entry:
             return -errno.ENOENT
+
+        if sync_engine._is_directory_type(entry["type"]):
+            old_root = normalize_icloud_path(oldpath)
+            new_root = normalize_icloud_path(newpath)
+            for descendant in state._fetch_subtree(old_root):
+                source_path = normalize_icloud_path(descendant["path"])
+                suffix = source_path[len(old_root) :]
+                target_path = normalize_icloud_path(new_root + suffix)
+                if not self._mutation_allowed("rename", source_path, target_path):
+                    return -errno.EACCES
 
         try:
             if self.mirror.exists(newpath):

@@ -622,6 +622,20 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             self.state.get_entry("/allowed/file.txt")
         )
 
+    def test_rename_rejects_allowed_directory_with_excluded_descendant(self):
+        self.engine.exclude_paths = ["/allowed/parent/excluded"]
+        self._add_entry("/allowed/parent", entry_type="folder")
+        self._add_entry("/allowed/parent/excluded", entry_type="folder")
+        self._add_entry("/allowed/parent/excluded/file.txt")
+
+        result = self.fs.rename("/allowed/parent", "/allowed/newparent")
+
+        self.assertEqual(result, -errno.EACCES)
+        self.assertTrue(self.mirror.exists("/allowed/parent/excluded/file.txt"))
+        self.assertFalse(self.mirror.exists("/allowed/newparent"))
+        self.assertIsNotNone(self.state.get_entry("/allowed/parent/excluded/file.txt"))
+        self.assertIsNone(self.state.get_entry("/allowed/newparent"))
+
     def test_empty_sync_paths_preserve_unrestricted_behavior(self):
         engine = ICloudSyncEngine(
             self.api,
