@@ -335,6 +335,54 @@ class OfflineCacheModeTests(unittest.TestCase):
         self.assertEqual(self.fs.create("/offline.txt", 0o644), -errno.EACCES)
 
 
+class RemoteSnapshotRaceTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        api = Mock()
+        api.drive.root = Mock()
+        self.engine = ICloudSyncEngine(api, self.mirror, self.state, Mock())
+
+    def tearDown(self):
+        self.engine.shutdown()
+        shutil.rmtree(self.root)
+
+    def _add_clean_remote_file(self, path, last_synced_at):
+        self.mirror.write(path, b"content", 0)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": os.path.dirname(path) or "/",
+                "remote_drivewsid": f"remote-{path}",
+                "size": 7,
+                "mtime": 123,
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "last_synced_at": last_synced_at,
+                "synced_path": path,
+            }
+        )
+
+    def test_snapshot_does_not_remove_file_synced_after_crawl_started(self):
+        self._add_clean_remote_file("/new.txt", last_synced_at=200)
+
+        self.engine._apply_remote_snapshot({}, crawl_started_at=200)
+
+        self.assertIsNotNone(self.state.get_entry("/new.txt"))
+        self.assertTrue(self.mirror.exists("/new.txt"))
+
+    def test_snapshot_still_removes_file_synced_before_crawl_started(self):
+        self._add_clean_remote_file("/old.txt", last_synced_at=199)
+
+        self.engine._apply_remote_snapshot({}, crawl_started_at=200)
+
+        self.assertIsNone(self.state.get_entry("/old.txt"))
+        self.assertFalse(self.mirror.exists("/old.txt"))
+
+
 class SyncEngineStartupTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")

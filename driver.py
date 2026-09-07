@@ -811,8 +811,9 @@ class ICloudSyncEngine:
         return self.state.count_entries() > 0 and os.path.isdir(self.mirror.root)
 
     def initial_scan(self):
+        crawl_started_at = int(time.time())
         snapshot = self._crawl_remote_snapshot()
-        self._apply_remote_snapshot(snapshot)
+        self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
 
     def _reconcile_persistent_cache(self):
         entries = self.state.list_entries()
@@ -1005,7 +1006,7 @@ class ICloudSyncEngine:
         )
         return snapshot
 
-    def _apply_remote_snapshot(self, snapshot):
+    def _apply_remote_snapshot(self, snapshot, crawl_started_at=None):
         remote_ids = set(snapshot.keys())
 
         for meta in snapshot.values():
@@ -1033,6 +1034,17 @@ class ICloudSyncEngine:
             if entry["dirty"]:
                 self.logger.warning("Remote deleted dirty path %s; keeping local copy for upload", entry["path"])
                 self.state.clear_remote_identity(entry["path"])
+                continue
+            synced_at = entry.get("last_synced_at")
+            if (
+                crawl_started_at is not None
+                and synced_at is not None
+                and synced_at >= crawl_started_at
+            ):
+                self.logger.info(
+                    "Keeping %s because it synced during the remote crawl",
+                    entry["path"],
+                )
                 continue
             self.logger.info("Removing clean path deleted remotely: %s", entry["path"])
             self.mirror.remove_tree(entry["path"])
@@ -1273,8 +1285,9 @@ class ICloudSyncEngine:
     def _run_remote_refresh(self, reason):
         try:
             self._log_sync("refresh-start", reason=reason)
+            crawl_started_at = int(time.time())
             snapshot = self._crawl_remote_snapshot()
-            self._apply_remote_snapshot(snapshot)
+            self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
             self._log_sync("refresh-complete", reason=reason)
         except Exception as exc:
             self.logger.error("Remote refresh failed (%s): %s", reason, exc)
