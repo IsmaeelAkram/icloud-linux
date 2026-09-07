@@ -67,6 +67,10 @@ sudo apt-get install -y fuse libfuse-dev pkg-config python3-venv
 sudo dnf install python3-devel fuse fuse-libs fuse-devel gcc make
 ```
 
+### NixOS
+
+For NixOS-specific instructions refer to [NixOS installation guide](NixOS_installation.md).
+
 ## Fast Setup
 
 ```bash
