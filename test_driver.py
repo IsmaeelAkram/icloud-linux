@@ -1,5 +1,7 @@
 import io
+import errno
 import os
+import stat
 import shutil
 import sqlite3
 import tempfile
@@ -7,7 +9,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from driver import ICloudSyncEngine, LocalMirror, SyncState
+from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
 
@@ -253,6 +255,84 @@ class DriverStateTests(unittest.TestCase):
         columns = migrated.conn.execute("PRAGMA table_info(entries)").fetchall()
 
         self.assertIn("remote_shareid", {column["name"] for column in columns})
+
+
+class OfflineCacheModeTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-offline-test-")
+        self.cache_dir = os.path.join(self.root, "cache")
+        self.mirror = LocalMirror(self.cache_dir)
+        self.state = SyncState(os.path.join(self.cache_dir, "state.sqlite3"))
+        self.fs = ICloudFS()
+        self.fs.api = None
+        self.fs.cache_dir = self.cache_dir
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+        self.fs.sync_engine = None
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def test_hydrated_cached_file_is_readable_without_session(self):
+        self.mirror.ensure_dir("/docs")
+        self.mirror.write("/docs/a.txt", b"cached", 0)
+        self.state.upsert_entry(
+            {
+                "path": "/docs/a.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "size": 6,
+                "mtime": 123,
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/docs/a.txt",
+            }
+        )
+
+        self.assertEqual(self.fs.open("/docs/a.txt", os.O_RDONLY), 0)
+        self.assertEqual(self.fs.read("/docs/a.txt", 100, 0), b"cached")
+
+    def test_metadata_only_entries_do_not_crash_getattr_without_session(self):
+        self.state.upsert_entry(
+            {
+                "path": "/remote-only",
+                "type": "folder",
+                "parent_path": "/",
+                "remote_drivewsid": "folder-1",
+                "size": 0,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/remote-only",
+            }
+        )
+        self.state.upsert_entry(
+            {
+                "path": "/remote-only/a.txt",
+                "type": "file",
+                "parent_path": "/remote-only",
+                "remote_drivewsid": "file-1",
+                "size": 5,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/remote-only/a.txt",
+            }
+        )
+
+        folder_attrs = self.fs.getattr("/remote-only")
+        file_attrs = self.fs.getattr("/remote-only/a.txt")
+
+        self.assertTrue(stat.S_ISDIR(folder_attrs.st_mode))
+        self.assertTrue(stat.S_ISREG(file_attrs.st_mode))
+        self.assertEqual(file_attrs.st_size, 5)
+
+    def test_writes_are_denied_without_session(self):
+        self.assertEqual(self.fs.create("/offline.txt", 0o644), -errno.EACCES)
 
 
 class SyncEngineStartupTests(unittest.TestCase):
