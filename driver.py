@@ -44,6 +44,35 @@ DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
 
 
+def normalize_icloud_path(path):
+    """Return an absolute, normalized iCloud Drive path."""
+    normalized = os.path.normpath("/" + path.lstrip("/"))
+    return "/" if normalized == "." else normalized
+
+
+def normalize_icloud_paths(paths):
+    """Normalize configured path prefixes, preserving an empty allow-list."""
+    if not paths:
+        return []
+    return [normalize_icloud_path(path) for path in paths]
+
+
+def path_allowed(path, sync_paths, exclude_paths):
+    """Return whether a path is within the configured synchronization boundary."""
+    path = normalize_icloud_path(path)
+
+    for prefix in exclude_paths:
+        if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
+            return False
+
+    if sync_paths is None:
+        return True
+    return any(
+        prefix == "/" or path == prefix or path.startswith(prefix + "/")
+        for prefix in sync_paths
+    )
+
+
 class Stat(fuse.Stat):
     def __init__(self):
         self.st_mode = 0
@@ -721,16 +750,9 @@ class ICloudSyncEngine:
         self.remote_refresh_interval_seconds = remote_refresh_interval_seconds
         self.warmup_workers = max(1, int(warmup_workers))
         self.auto_sync = bool(auto_sync)
-        # Normalise sync_paths: list of /-prefixed strings, or None = allow all
-        if sync_paths:
-            self.sync_paths = [p if p.startswith('/') else '/' + p for p in sync_paths]
-        else:
-            self.sync_paths = None
-        # Normalise exclude_paths: deny-list applied before sync_paths
-        if exclude_paths:
-            self.exclude_paths = [p if p.startswith('/') else '/' + p for p in exclude_paths]
-        else:
-            self.exclude_paths = []
+        # An empty sync_paths value preserves unrestricted syncing.
+        self.sync_paths = normalize_icloud_paths(sync_paths) or None
+        self.exclude_paths = normalize_icloud_paths(exclude_paths)
         self.executor = ThreadPoolExecutor(max_workers=self.warmup_workers, thread_name_prefix="warmup")
         self.stop_event = threading.Event()
         self.refresh_now_event = threading.Event()
@@ -1305,7 +1327,10 @@ class ICloudSyncEngine:
             self._run_remote_refresh("manual" if manual else "scheduled")
 
     def sync_dirty_entries(self):
-        dirty_entries = self.state.list_dirty_entries()
+        dirty_entries = [
+            entry for entry in self.state.list_dirty_entries()
+            if self._entry_allowed_to_sync(entry)
+        ]
         if not dirty_entries:
             return
 
@@ -1436,6 +1461,23 @@ class ICloudSyncEngine:
             node.rename(new_name)
         self._log_sync("move-complete", path=synced_path, target_path=entry["path"])
 
+    def _entry_allowed_to_sync(self, entry):
+        paths = [entry["path"]]
+        synced_path = entry.get("synced_path")
+        if synced_path and synced_path != entry["path"]:
+            paths.append(synced_path)
+
+        if all(self._path_allowed(path) for path in paths):
+            return True
+
+        self._log_sync(
+            "dirty-skip-disallowed",
+            level=logging.WARNING,
+            path=entry["path"],
+            synced_path=synced_path,
+        )
+        return False
+
     def _ensure_remote_parent(self, path):
         parent_path = os.path.dirname(path) or "/"
         if parent_path == "/":
@@ -1524,28 +1566,8 @@ class ICloudSyncEngine:
         )
 
     def _path_allowed(self, path):
-        """Return True if this path should be hydrated/downloaded.
-
-        Rules (evaluated in order):
-          1. exclude_paths deny-list — any matching prefix blocks hydration,
-             regardless of sync_paths.  This lets you carve out large
-             subdirectories from an otherwise-allowed sync_path.
-          2. sync_paths allow-list — if set, only matching prefixes are
-             hydrated.  None means allow all (minus exclusions).
-        """
-        # 1. Deny-list check first
-        if self.exclude_paths:
-            for prefix in self.exclude_paths:
-                if path == prefix or path.startswith(prefix + '/'):
-                    return False
-
-        # 2. Allow-list check
-        if self.sync_paths is None:
-            return True
-        for prefix in self.sync_paths:
-            if path == prefix or path.startswith(prefix + '/'):
-                return True
-        return False
+        """Return True when a path may be hydrated or synchronized."""
+        return path_allowed(path, self.sync_paths, self.exclude_paths)
 
     def _path_lock(self, path):
         with self.path_locks_lock:
@@ -1578,6 +1600,26 @@ class ICloudFS(Fuse):
             self.logger.log(level, "file-op %s %s", op, details)
             return
         self.logger.log(level, "file-op %s", op)
+
+    def _mutation_allowed(self, operation, *paths):
+        if self.sync_engine is None:
+            self._log_file_op(
+                operation,
+                level=logging.WARNING,
+                reason="sync-engine-unavailable",
+            )
+            return False
+
+        if all(self.sync_engine._path_allowed(path) for path in paths):
+            return True
+
+        self._log_file_op(
+            operation,
+            paths=", ".join(paths),
+            level=logging.WARNING,
+            reason="path-policy",
+        )
+        return False
 
     def shutdown(self):
         if self.sync_engine is not None:
@@ -1767,10 +1809,12 @@ class ICloudFS(Fuse):
 
     def open(self, path, flags):
         self._log_file_op("open", path, level=logging.DEBUG, flags=flags)
+        if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
+            if not self._is_authenticated() or not self._mutation_allowed("open", path):
+                return -errno.EACCES
         if not self.state.get_entry(path):
             if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
-                self.create(path, 0o644, flags)
-                return 0
+                return self.create(path, 0o644, flags)
             return -errno.ENOENT
 
         entry = self.state.get_entry(path)
@@ -1792,6 +1836,8 @@ class ICloudFS(Fuse):
 
     def create(self, path, mode, flags=None):
         if not self._is_authenticated():
+            return -errno.EACCES
+        if not self._mutation_allowed("create", path):
             return -errno.EACCES
         try:
             self.mirror.create_file(path)
@@ -1839,6 +1885,8 @@ class ICloudFS(Fuse):
     def write(self, path, buf, offset):
         if not self._is_authenticated():
             return -errno.EACCES
+        if not self._mutation_allowed("write", path):
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
             try:
@@ -1884,6 +1932,8 @@ class ICloudFS(Fuse):
     def mkdir(self, path, mode):
         if not self._is_authenticated():
             return -errno.EACCES
+        if not self._mutation_allowed("mkdir", path):
+            return -errno.EACCES
         try:
             self.mirror.ensure_dir(path)
             stats = self.mirror.stat_local(path)
@@ -1910,6 +1960,8 @@ class ICloudFS(Fuse):
     def rmdir(self, path):
         if not self._is_authenticated():
             return -errno.EACCES
+        if not self._mutation_allowed("rmdir", path):
+            return -errno.EACCES
         entry = self.state.get_entry(path)
         if not entry:
             return -errno.ENOENT
@@ -1931,6 +1983,8 @@ class ICloudFS(Fuse):
 
     def unlink(self, path):
         if not self._is_authenticated():
+            return -errno.EACCES
+        if not self._mutation_allowed("unlink", path):
             return -errno.EACCES
         entry = self.state.get_entry(path)
         if not entry:
@@ -1955,9 +2009,25 @@ class ICloudFS(Fuse):
     def rename(self, oldpath, newpath):
         if not self._is_authenticated():
             return -errno.EACCES
-        entry = self.state.get_entry(oldpath)
+        if not self._mutation_allowed("rename", oldpath, newpath):
+            return -errno.EACCES
+        sync_engine = self.sync_engine
+        state = self.state
+        if sync_engine is None or state is None:
+            return -errno.EACCES
+        entry = state.get_entry(oldpath)
         if not entry:
             return -errno.ENOENT
+
+        if sync_engine._is_directory_type(entry["type"]):
+            old_root = normalize_icloud_path(oldpath)
+            new_root = normalize_icloud_path(newpath)
+            for descendant in state._fetch_subtree(old_root):
+                source_path = normalize_icloud_path(descendant["path"])
+                suffix = source_path[len(old_root) :]
+                target_path = normalize_icloud_path(new_root + suffix)
+                if not self._mutation_allowed("rename", source_path, target_path):
+                    return -errno.EACCES
 
         try:
             if self.mirror.exists(newpath):
@@ -1979,6 +2049,8 @@ class ICloudFS(Fuse):
 
     def truncate(self, path, length):
         if not self._is_authenticated():
+            return -errno.EACCES
+        if not self._mutation_allowed("truncate", path):
             return -errno.EACCES
         entry = self.state.get_entry(path)
         if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
@@ -2022,6 +2094,10 @@ class ICloudFS(Fuse):
         return self.create(path, mode)
 
     def utime(self, path, times):
+        if not self._is_authenticated():
+            return -errno.EACCES
+        if not self._mutation_allowed("utime", path):
+            return -errno.EACCES
         try:
             if not self.mirror.exists(path):
                 return -errno.ENOENT

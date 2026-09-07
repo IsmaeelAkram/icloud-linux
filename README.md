@@ -172,13 +172,22 @@ On later runs:
 - if `auto_sync: true`, it refreshes remote metadata and uploads local changes on a timer
 - if `auto_sync: false`, it mounts immediately with no background polling; run `icloudctl sync` on demand
 
-## Controlling What Gets Hydrated
+## Controlling the Synchronization Boundary
 
-By default all of iCloud Drive is indexed (stubs created everywhere), but you can restrict which paths have their file contents downloaded.
+By default all of iCloud Drive is indexed (stubs created everywhere), and the
+mount permits mutations throughout the drive. Configure `sync_paths` to make
+selective sync a hard boundary: only allowlisted paths can be hydrated or
+mutated through the mount.
 
-**`sync_paths`** — allow-list. Only paths in this list will have file contents downloaded. Everything else is stubs only.
+**`sync_paths`** — allow-list. Only paths in this list have file contents
+downloaded or may be created, written, truncated, renamed, moved, or deleted
+through the mount. Operations outside the allowlist fail with `EACCES` and are
+never queued for upload. An empty or omitted value retains unrestricted
+behavior.
 
-**`exclude_paths`** — deny-list. Paths matching these prefixes are never hydrated, even if they fall under a `sync_path`. The deny-list is evaluated first.
+**`exclude_paths`** — deny-list. Paths matching these prefixes are never
+hydrated or mutated through the mount, even if they fall under a `sync_path`.
+The deny-list is evaluated first.
 
 Example config:
 
@@ -193,11 +202,14 @@ exclude_paths:
 ```
 
 With this config:
-- `/Downloads/*` → file contents downloaded
-- `/Downloads/Large Archive/*` → stubs only, no download
-- Everything else on iCloud → stubs only
 
-When you're ready to hydrate an excluded folder, remove it from `exclude_paths` and restart the service.
+- `/Downloads/*` → file contents downloaded and mutations permitted
+- `/Downloads/Large Archive/*` → stubs only; mutations rejected
+- Everything else on iCloud → stubs only; mutations rejected
+
+For a rename or move, both the source and destination must be permitted.
+When you're ready to synchronize an excluded folder, remove it from
+`exclude_paths` and restart the service.
 
 ## Auto-Sync vs On-Demand Sync
 

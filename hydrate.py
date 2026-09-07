@@ -30,11 +30,17 @@ import yaml
 
 # ── path filtering (mirrors ICloudSyncEngine._path_allowed) ──────────────────
 
+def _normalise_path(path):
+    """Return an absolute, canonical iCloud Drive path."""
+    normalized = os.path.normpath("/" + str(path).lstrip("/"))
+    return "/" if normalized == "." else normalized
+
+
 def _normalise(paths):
-    """Ensure all paths start with /."""
+    """Canonicalize configured path prefixes."""
     if not paths:
         return []
-    return [p if p.startswith("/") else "/" + p for p in paths]
+    return [_normalise_path(path) for path in paths]
 
 
 def path_allowed(path, sync_paths, exclude_paths):
@@ -45,6 +51,10 @@ def path_allowed(path, sync_paths, exclude_paths):
       2. sync_paths allow-list — if set, only matching prefixes hydrate.
          None means allow all (minus exclusions).
     """
+    path = _normalise_path(path)
+    exclude_paths = _normalise(exclude_paths)
+    sync_paths = None if sync_paths is None else _normalise(sync_paths)
+
     # 1. Deny-list
     for prefix in exclude_paths:
         if path == prefix or path.startswith(prefix + "/"):
