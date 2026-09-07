@@ -1,4 +1,7 @@
-fuse-python
+# The Python 3.14 wheel for fuse-python 1.0.9 can omit its libfuse
+# dependency. Build it locally so the extension links against libfuse2.
+--no-binary=fuse-python
+fuse-python==1.0.9
 pyyaml
 pyicloud>=2.6.4
 # pyicloud 2.7.0 imports its Notes renderer from the core package, but
