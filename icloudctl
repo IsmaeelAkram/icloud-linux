@@ -285,10 +285,11 @@ Commands:
   quickstart [mount_dir]   One-command guided setup
   init [mount_dir]         Initialize venv/config/service files
   configure [email]        Write config.yaml with credentials
-  auth [--force-sms] [--debug] [--trust-token TOKEN]
+  auth [--force-sms] [--debug] [--accept-terms] [--trust-token TOKEN]
                            Run interactive 2FA bootstrap.
                            --force-sms bypasses push delivery (iOS 26 beta workaround)
                            --debug prints Apple's reported auth mode for diagnosis
+                           --accept-terms accepts Apple's updated iCloud terms
   hydrate [--dry-run] [--verbose]
                            Block until all eligible files are downloaded locally.
                            Honors sync_paths and exclude_paths from config.
