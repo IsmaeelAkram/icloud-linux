@@ -8,9 +8,11 @@ Modes:
      phone number — useful when iOS beta push doesn't show a numeric code
   3. --trust-token <value>: inject a browser trust-token extracted from
      icloud.com DevTools → Application → Cookies → X-APPLE-WEBAUTH-HSA-TRUST
+  4. --accept-terms: accept Apple's updated iCloud terms of service
 
 Usage:
   ./icloudctl auth
+  ./icloudctl auth --accept-terms
   .venv/bin/python auth.py ~/.config/icloud-linux/config.yaml
   .venv/bin/python auth.py ~/.config/icloud-linux/config.yaml --force-sms
   .venv/bin/python auth.py ~/.config/icloud-linux/config.yaml --trust-token <TOKEN>
@@ -143,6 +145,7 @@ def main():
         if idx + 1 < len(args):
             trust_token = args[idx + 1]
     debug = "--debug" in args
+    accept_terms = "--accept-terms" in args
 
     cfg = load_config(config_path)
     username = cfg.get("username")
@@ -168,6 +171,7 @@ def main():
     api = PyiCloudService(
         username, password,
         cookie_directory=cookie_dir,
+        accept_terms=accept_terms,
         authenticate=False,
     )
     if endpoint:

@@ -113,6 +113,12 @@ If Apple expires your session, run:
 ./icloudctl restart
 ```
 
+If Apple reports that updated terms of service must be accepted, run:
+
+```bash
+./icloudctl auth --accept-terms
+```
+
 ### iOS 26 Beta 2FA Workaround
 
 iOS 26 beta may deliver a push notification popup instead of a numeric 2FA code. If this happens, use the `--force-sms` flag to bypass the push path and request an SMS code directly:
