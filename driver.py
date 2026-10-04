@@ -15,7 +15,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, ExitStack
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -143,6 +143,8 @@ class SyncState:
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode = WAL;")
+        self.conn.execute("PRAGMA synchronous = NORMAL;")
         self._init_db()
 
     def _init_db(self):
@@ -190,7 +192,7 @@ class SyncState:
                 self.conn.execute("ALTER TABLE entries ADD COLUMN remote_shareid TEXT")
             self.conn.commit()
 
-    def upsert_entry(self, entry):
+    def upsert_entry(self, entry, commit=True):
         payload = {
             "path": entry["path"],
             "type": entry["type"],
@@ -240,6 +242,11 @@ class SyncState:
                 """,
                 payload,
             )
+            if commit:
+                self.conn.commit()
+
+    def commit(self):
+        with self.lock:
             self.conn.commit()
 
     def get_entry(self, path):
@@ -856,14 +863,15 @@ class ICloudSyncEngine:
                 stats = self.mirror.stat_local(path)
                 checksum = entry.get("local_sha256")
                 hydrated = bool(entry["hydrated"])
-                if entry["type"] == "file" and (hydrated or not entry["remote_drivewsid"]):
-                    hydrated = True
+                if entry["type"] == "file":
+                    if entry["dirty"] or not entry["remote_drivewsid"] or entry.get("size", 0) == 0:
+                        hydrated = True
                     # Only recompute the SHA256 if size or mtime changed since
                     # the last recorded sync — reading every file on startup is
                     # the cause of the 4-minute / 11 GB memory blowup at boot.
                     size_changed = stats.st_size != int(entry.get("size") or 0)
                     mtime_changed = int(stats.st_mtime) != int(entry.get("mtime") or 0)
-                    if size_changed or mtime_changed or not checksum:
+                    if hydrated and (size_changed or mtime_changed or not checksum):
                         checksum = self.mirror.file_sha256(path)
                 self.state.upsert_entry(
                     {
@@ -872,14 +880,15 @@ class ICloudSyncEngine:
                         "mtime": int(stats.st_mtime),
                         "hydrated": hydrated,
                         "local_sha256": checksum,
-                    }
+                    },
+                    commit=False,
                 )
                 continue
 
             missing_files += 1
             if entry["remote_drivewsid"]:
                 self.mirror.materialize_placeholder(path, entry["size"], entry["mtime"])
-                self.state.upsert_entry({**entry, "hydrated": entry["size"] == 0})
+                self.state.upsert_entry({**entry, "hydrated": entry["size"] == 0}, commit=False)
             else:
                 self.mirror.create_file(path)
                 stats = self.mirror.stat_local(path)
@@ -891,8 +900,11 @@ class ICloudSyncEngine:
                         "mtime": int(stats.st_mtime),
                         "hydrated": True,
                         "local_sha256": checksum,
-                    }
+                    },
+                    commit=False,
                 )
+
+        self.state.commit()
 
         self.logger.info(
             "Persistent cache ready: %s entries, %s directories recreated, %s files queued for hydration",
@@ -903,6 +915,24 @@ class ICloudSyncEngine:
 
     def _is_directory_type(self, node_type):
         return (node_type or "").lower() in DIRECTORY_NODE_TYPES
+
+    @staticmethod
+    def _is_deleted_document(exc):
+        # pyicloud wraps Apple's DocumentDeletedException in an auth exception.
+        message = str(exc)
+        return ("DocumentDeletedException" in message or
+                ("NOT_FOUND" in message and
+                 ("404" in message or "409" in message)))
+
+    def _valid_local_content(self, entry):
+        path = entry["path"]
+        if not self.mirror.exists(path) or self.mirror.is_dir(path):
+            return False
+        # Placeholders are sparse files of the advertised size, not downloads.
+        if entry["hydrated"] or entry["dirty"]:
+            return True
+        checksum = entry.get("local_sha256")
+        return bool(checksum and self.mirror.file_sha256(path) == checksum)
 
     def ensure_local_file(self, path):
         if not self._path_allowed(path):
@@ -920,10 +950,10 @@ class ICloudSyncEngine:
                 return
             if entry["hydrated"] and self.mirror.exists(path):
                 return
-            if not entry["remote_drivewsid"]:
+            if entry["dirty"] or not entry["remote_drivewsid"]:
                 self._log_sync("hydrate-local", level=logging.DEBUG, path=path)
                 if not self.mirror.exists(path):
-                    self.mirror.create_file(path)
+                    raise FileNotFoundError(f"Missing local content for {path}")
                 checksum = self.mirror.file_sha256(path)
                 stats = self.mirror.stat_local(path)
                 self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
@@ -944,22 +974,37 @@ class ICloudSyncEngine:
                 size=entry.get("size"),
             )
             self.logger.debug("Hydrating %s", path)
-            with self.download_semaphore:
-                self.logger.debug(
-                    "Hydrating file path=%s drivewsid=%s docwsid=%s zone=%s size=%s",
-                    path,
-                    entry.get("remote_drivewsid"),
-                    entry.get("remote_docwsid"),
-                    entry.get("remote_zone"),
-                    entry.get("size"),
-                )
-                node = self._node_from_entry(entry)
-                with closing(node.open(stream=True)) as response:
-                    self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
+            try:
+                self._download_content(entry)
+            except Exception as exc:
+                valid_local = self._valid_local_content(entry)
+                if self._is_deleted_document(exc):
+                    if valid_local:
+                        self.state.clear_remote_identity(path)
+                        self.logger.warning("Detached deleted remote document for local upload: %s", path)
+                    else:
+                        # Atomic replacement may have created a new ID at this path.
+                        # Refresh the parent once; never manufacture content from a placeholder.
+                        meta = self._refresh_child_meta(os.path.dirname(path) or "/", os.path.basename(path))
+                        if meta["remote_drivewsid"] == entry["remote_drivewsid"]:
+                            raise exc
+                        entry = {**entry, **meta, "hydrated": False, "local_sha256": None}
+                        self.state.upsert_entry(entry)
+                        self._download_content(entry)
+                elif not valid_local:
+                    raise
+                else:
+                    self.logger.warning("Serving verified local content after hydration failure: %s", path)
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
             self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
             self._log_sync("hydrate-complete", level=logging.INFO, path=path, source="remote", size=stats.st_size)
+
+    def _download_content(self, entry):
+        with self.download_semaphore:
+            node = self._node_from_entry(entry)
+            with closing(node.open(stream=True)) as response:
+                self.mirror.write_atomic_stream(entry["path"], response.raw, entry["mtime"])
 
     def _crawl_remote_snapshot(self):
         self.logger.info("Starting remote metadata crawl")
@@ -1397,6 +1442,12 @@ class ICloudSyncEngine:
             self.logger.error("Failed syncing directory %s: %s", entry["path"], exc)
 
     def _sync_file(self, entry):
+        with self._path_lock(entry["path"]):
+            entry = self.state.get_entry(entry["path"])
+            if entry and entry["dirty"] and not entry["tombstone"]:
+                self._sync_file_locked(entry)
+
+    def _sync_file_locked(self, entry):
         parent_node = self._ensure_remote_parent(entry["path"])
         if parent_node is None:
             return
@@ -1414,6 +1465,7 @@ class ICloudSyncEngine:
                 return
 
             self.ensure_local_file(entry["path"])
+            entry = self.state.get_entry(entry["path"])
 
             if entry["remote_drivewsid"] and entry["synced_path"] and entry["synced_path"] != entry["path"]:
                 self._sync_move_or_rename(entry)
@@ -1422,8 +1474,11 @@ class ICloudSyncEngine:
             if entry["remote_drivewsid"]:
                 try:
                     self._node_from_entry(entry).delete()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if not self._is_deleted_document(exc):
+                        raise
+                # A failed upload must not leave a deleted document ID in state.
+                self.state.clear_remote_identity(entry["path"])
 
             with open(self.mirror.local_path(entry["path"]), "rb") as handle:
                 parent_node.upload(
@@ -1573,7 +1628,7 @@ class ICloudSyncEngine:
         with self.path_locks_lock:
             lock = self.path_locks.get(path)
             if lock is None:
-                lock = threading.Lock()
+                lock = threading.RLock()
                 self.path_locks[path] = lock
             return lock
 
@@ -2029,18 +2084,37 @@ class ICloudFS(Fuse):
                 if not self._mutation_allowed("rename", source_path, target_path):
                     return -errno.EACCES
 
+        if oldpath == newpath:
+            return 0
         try:
-            if self.mirror.exists(newpath):
-                self.mirror.remove_tree(newpath)
-                existing = self.state.get_entry(newpath)
-                if existing:
-                    if existing["remote_drivewsid"]:
-                        self.state.mark_tombstone(newpath)
-                    else:
-                        self.state.remove_subtree(newpath)
-            self.mirror.rename_path(oldpath, newpath)
-            self.state.rename_tree(oldpath, newpath, root_dirty=True)
-            self.state.queue_op("rename", oldpath, newpath)
+            with ExitStack() as locks:
+                for path in sorted({oldpath, newpath}):
+                    locks.enter_context(sync_engine._path_lock(path))
+                entry = state.get_entry(oldpath)
+                existing = state.get_entry(newpath)
+                if existing and entry["type"] == "file" and existing["type"] == "file":
+                    sync_engine.ensure_local_file(oldpath)
+                    entry = state.get_entry(oldpath)
+                    # Keep the destination identity for the upload replacement;
+                    # remove an already-uploaded temporary document separately.
+                    self.mirror.rename_path(oldpath, newpath)
+                    replacement = {**existing, "size": entry["size"], "mtime": entry["mtime"],
+                                   "local_sha256": entry.get("local_sha256"),
+                                   "dirty": True, "hydrated": True, "tombstone": False}
+                    with state.lock, state.conn:
+                        state.upsert_entry(replacement, commit=False)
+                        state.conn.execute("DELETE FROM pending_ops WHERE path IN (?, ?) OR target_path IN (?, ?)",
+                                           (oldpath, newpath, oldpath, newpath))
+                        if entry["remote_drivewsid"] and entry["remote_drivewsid"] != existing["remote_drivewsid"]:
+                            state.conn.execute("UPDATE entries SET tombstone=1, dirty=1 WHERE path=?", (oldpath,))
+                        else:
+                            state.conn.execute("DELETE FROM entries WHERE path=?", (oldpath,))
+                else:
+                    if existing:
+                        return -errno.EISDIR if existing["type"] != "file" else -errno.ENOTDIR
+                    self.mirror.rename_path(oldpath, newpath)
+                    state.rename_tree(oldpath, newpath, root_dirty=True)
+                    state.queue_op("rename", oldpath, newpath)
             self._log_file_op("rename", oldpath, target_path=newpath)
             return 0
         except Exception as exc:
@@ -2193,6 +2267,12 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     logging.getLogger("pyicloud.base").addFilter(IgnoreIcdrsWarning())
 
     config = parse_config(args.config)
+    fuse_options = config.get("fuse_options", {})
+    if isinstance(fuse_options, dict):
+        for opt_name, enabled in fuse_options.items():
+            if enabled:
+                fs.fuse_args.add(opt_name)
+
     username = config.get("username")
     password = config.get("password")
     if not username or not password:
