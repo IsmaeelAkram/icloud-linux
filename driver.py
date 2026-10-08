@@ -838,11 +838,36 @@ class ICloudSyncEngine:
         self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
 
     def _reconcile_persistent_cache(self):
+        self.logger.info("Cache: Loading entries from SQLite")
+        started = time.monotonic()
         entries = self.state.list_entries()
+        total = len(entries)
+
+        self.logger.info(
+            "Cache: loaded %d entries in %.1fs.",
+            total, time.monotonic() - started,
+        )
+
+        reconcile_started = time.monotonic()
+
         missing_files = 0
         recreated_dirs = 0
+        skipped_entries = 0
+        updated_entries = 0
 
-        for entry in entries:
+        for index, entry in enumerate(entries, 1):
+            if index == 100 or index % 100000 == 0 or index == total:
+                elapsed = time.monotonic() - reconcile_started
+                rate = index / elapsed if elapsed > 0 else 0
+                eta = (total - index) / rate if rate > 0 else 0
+
+                self.logger.info(
+                    "Cache reconciliation: %d/%d (%.1f%%), %.1fs elapsed, "
+                    "ETA %.0fs",
+                    index, total, index / total * 100,
+                    elapsed, eta
+                )
+
             path = entry["path"]
             if entry["tombstone"]:
                 continue
@@ -856,30 +881,48 @@ class ICloudSyncEngine:
                 stats = self.mirror.stat_local(path)
                 checksum = entry.get("local_sha256")
                 hydrated = bool(entry["hydrated"])
-                if entry["type"] == "file" and (hydrated or not entry["remote_drivewsid"]):
+
+                new_size = stats.st_size
+                new_mtime = int(stats.st_mtime)
+
+                if (
+                    entry["type"] == "file"
+                    and (hydrated or not entry["remote_drivewsid"])
+                ):
                     hydrated = True
                     # Only recompute the SHA256 if size or mtime changed since
                     # the last recorded sync — reading every file on startup is
                     # the cause of the 4-minute / 11 GB memory blowup at boot.
-                    size_changed = stats.st_size != int(entry.get("size") or 0)
-                    mtime_changed = int(stats.st_mtime) != int(entry.get("mtime") or 0)
+                    size_changed = new_size != int(entry.get("size") or 0)
+                    mtime_changed = new_mtime != int(entry.get("mtime") or 0)
                     if size_changed or mtime_changed or not checksum:
                         checksum = self.mirror.file_sha256(path)
-                self.state.upsert_entry(
-                    {
-                        **entry,
-                        "size": stats.st_size,
-                        "mtime": int(stats.st_mtime),
-                        "hydrated": hydrated,
-                        "local_sha256": checksum,
-                    }
-                )
+
+                if (
+                    new_size != int(entry.get("size") or 0)
+                    or new_mtime != int(entry.get("mtime") or 0)
+                    or hydrated != bool(entry["hydrated"])
+                    or checksum != entry.get("local_sha256")
+                ):
+                    self.state.upsert_entry(
+                        {
+                            **entry,
+                            "size": new_size,
+                            "mtime": new_mtime,
+                            "hydrated": hydrated,
+                            "local_sha256": checksum,
+                        }
+                    )
+                    updated_entries += 1
+                else:
+                    skipped_entries += 1
                 continue
 
             missing_files += 1
             if entry["remote_drivewsid"]:
                 self.mirror.materialize_placeholder(path, entry["size"], entry["mtime"])
                 self.state.upsert_entry({**entry, "hydrated": entry["size"] == 0})
+                updated_entries += 1
             else:
                 self.mirror.create_file(path)
                 stats = self.mirror.stat_local(path)
@@ -893,12 +936,15 @@ class ICloudSyncEngine:
                         "local_sha256": checksum,
                     }
                 )
+                updated_entries += 1
 
         self.logger.info(
-            "Persistent cache ready: %s entries, %s directories recreated, %s files queued for hydration",
+            "Cache: Loaded & reconciled in %.1fs. %d/%d updated, %d missing, %d dirs recreated.",
+            time.monotonic() - started,
+            updated_entries,
             len(entries),
-            recreated_dirs,
             missing_files,
+            recreated_dirs
         )
 
     def _is_directory_type(self, node_type):
