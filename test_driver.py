@@ -11,7 +11,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
+from driver import HTTP_TIMEOUT, ICloudFS, ICloudSyncEngine, LocalMirror, SyncState, _apply_default_timeout
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
 
@@ -862,6 +862,27 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             self.assertTrue(engine._path_allowed("/outside/file.txt"))
         finally:
             engine.shutdown()
+
+
+class DefaultTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.session = Mock()
+        self.inner = self.session.request
+        _apply_default_timeout(self.session)
+
+    def test_requests_without_timeout_get_default(self):
+        self.session.request("GET", "https://example.invalid", stream=True)
+        self.inner.assert_called_once_with(
+            "GET", "https://example.invalid", stream=True, timeout=HTTP_TIMEOUT
+        )
+
+    def test_explicit_none_timeout_gets_default(self):
+        self.session.request("GET", "https://example.invalid", timeout=None)
+        self.inner.assert_called_once_with("GET", "https://example.invalid", timeout=HTTP_TIMEOUT)
+
+    def test_explicit_timeout_is_kept(self):
+        self.session.request("POST", "https://example.invalid", timeout=5)
+        self.inner.assert_called_once_with("POST", "https://example.invalid", timeout=5)
 
 
 if __name__ == "__main__":
