@@ -42,6 +42,22 @@ fuse.fuse_python_api = (0, 2)
 ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
 DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
+# (connect, read) timeout applied to every iCloud HTTP request that does not
+# set its own. Without it a connection stalled by suspend/resume blocks a
+# FUSE open() forever, the caller sits in D state and the next suspend fails.
+HTTP_TIMEOUT = (15, 60)
+
+
+def _apply_default_timeout(session, timeout=HTTP_TIMEOUT):
+    """Make *session* use *timeout* for requests that do not pass one."""
+    request = session.request
+
+    def request_with_timeout(method, url, *args, **kwargs):
+        if not args and kwargs.get("timeout") is None:
+            kwargs["timeout"] = timeout
+        return request(method, url, *args, **kwargs)
+
+    session.request = request_with_timeout
 
 
 def normalize_icloud_path(path):
@@ -1656,6 +1672,7 @@ class ICloudFS(Fuse):
             self.api = PyiCloudService(username, password,
                                        cookie_directory=cookie_dir,
                                        authenticate=False)
+            _apply_default_timeout(self.api.session)
             if _partition:
                 self.api._setup_endpoint = (
                     f"https://p{_partition}-setup.icloud.com/setup/ws/1"
