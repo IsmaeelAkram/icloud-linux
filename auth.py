@@ -27,7 +27,10 @@ import sys
 import yaml
 import requests
 from pyicloud import PyiCloudService
-from pyicloud.exceptions import PyiCloud2FARequiredException
+from pyicloud.exceptions import (
+    PyiCloud2FARequiredException,
+    PyiCloudAPIResponseException,
+)
 
 
 def load_config(path):
@@ -68,6 +71,21 @@ def print_auth_diagnostics(api):
     print("------------------------\n")
 
 
+def sms_code_was_accepted(exc):
+    """Recognize Apple's HTTP 409 response for an accepted SMS code."""
+    response = getattr(exc, "response", None)
+    if response is None or response.status_code != 409:
+        return False
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    security_code = payload.get("securityCode")
+    return isinstance(security_code, dict) and security_code.get("valid") is True
+
+
 def do_sms_forced(api):
     """Force SMS delivery regardless of what push_mode Apple reported.
 
@@ -92,13 +110,23 @@ def do_sms_forced(api):
     # _validate_sms_code is the correct path when delivery mode is sms
     try:
         api._validate_sms_code(code)
+    except PyiCloudAPIResponseException as exc:
+        if not sms_code_was_accepted(exc):
+            print("Code validation failed.", file=sys.stderr)
+            sys.exit(1)
+        print("Apple accepted the SMS code.")
     except Exception as exc:
-        print(f"Code validation failed: {exc}", file=sys.stderr)
+        print(
+            f"Code validation failed ({type(exc).__name__}).",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if not api.is_trusted_session:
         print("Trusting session...")
-        api.trust_session()
+        if not api.trust_session():
+            print("Apple accepted the code but did not trust the session.", file=sys.stderr)
+            sys.exit(1)
 
 
 def do_2fa(api):
