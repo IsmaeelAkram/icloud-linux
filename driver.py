@@ -955,7 +955,10 @@ class ICloudSyncEngine:
                 )
                 node = self._node_from_entry(entry)
                 with closing(node.open(stream=True)) as response:
-                    self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
+                    if response._content_consumed is True:
+                        self.mirror.write_atomic_bytes(path, response.content, entry["mtime"])
+                    else:
+                        self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
             self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))

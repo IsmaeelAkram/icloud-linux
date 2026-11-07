@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import Mock
+from requests.models import Response
 
 from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
@@ -669,6 +670,109 @@ class SyncEngineStartupTests(unittest.TestCase):
 
         self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"chunked download")
         response.close.assert_called_once()
+
+    def test_ensure_local_file_preserves_consumed_json_response(self):
+        payload = b'{"enabled":true}'
+        response = Response()
+        response.status_code = 200
+        response.raw = io.BytesIO(payload)
+        self.assertEqual(response.json(), {"enabled": True})
+        self.state.upsert_entry(
+            {
+                "path": "/docs/settings.json",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "size": len(payload),
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+            }
+        )
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine.ensure_local_file("/docs/settings.json")
+
+        self.assertEqual(self.mirror.read("/docs/settings.json", 100, 0), payload)
+        entry = self.state.get_entry("/docs/settings.json")
+        self.assertEqual(entry["size"], len(payload))
+        self.assertEqual(entry["hydrated"], 1)
+        self.assertEqual(entry["dirty"], 0)
+
+    def test_ensure_local_file_uses_real_node_for_consumed_json_response(self):
+        payload = b'{"enabled":true}'
+        payload += b" " * (696 - len(payload))
+        response = Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "application/json"
+        response.headers["Content-Length"] = str(len(payload))
+        response.raw = io.BytesIO(payload)
+        self.assertEqual(response.json(), {"enabled": True})
+        self.state.upsert_entry(
+            {
+                "path": "/docs/core-plugins.json",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_zone": "zone-1",
+                "size": len(payload),
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+            }
+        )
+        self.engine.api.drive.get_file.return_value = response
+
+        self.engine.ensure_local_file("/docs/core-plugins.json")
+
+        self.engine.api.drive.get_file.assert_called_once_with(
+            "doc-1", zone="zone-1", stream=True
+        )
+        self.assertEqual(self.mirror.read("/docs/core-plugins.json", 1000, 0), payload)
+        entry = self.state.get_entry("/docs/core-plugins.json")
+        self.assertEqual(entry["size"], len(payload))
+        self.assertEqual(entry["hydrated"], 1)
+        self.assertEqual(entry["dirty"], 0)
+
+    def test_ensure_local_file_preserves_empty_response(self):
+        for consumed in (False, True):
+            with self.subTest(consumed=consumed):
+                path = f"/docs/empty-{consumed}.txt"
+                response = Response()
+                response.status_code = 200
+                response.raw = io.BytesIO(b"")
+                if consumed:
+                    self.assertEqual(response.content, b"")
+                self.state.upsert_entry(
+                    {
+                        "path": path,
+                        "type": "file",
+                        "parent_path": "/docs",
+                        "remote_drivewsid": "file-1",
+                        "size": 0,
+                        "mtime": 123,
+                        "hydrated": False,
+                        "dirty": False,
+                        "tombstone": False,
+                    }
+                )
+                node = Mock()
+                node.open.return_value = response
+                self.engine._node_from_entry = Mock(return_value=node)
+
+                self.engine.ensure_local_file(path)
+
+                self.assertTrue(self.mirror.exists(path))
+                self.assertEqual(self.mirror.read(path, 100, 0), b"")
+                entry = self.state.get_entry(path)
+                self.assertEqual(entry["size"], 0)
+                self.assertEqual(entry["hydrated"], 1)
+                self.assertEqual(entry["dirty"], 0)
 
     def test_sync_file_uploads_stream_without_buffering_entire_file(self):
         self.mirror.create_file("/docs/a.txt")
