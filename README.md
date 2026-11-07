@@ -337,5 +337,7 @@ This reports how many files are already local vs need downloading, without downl
 
 - Warmup downloads are intentionally conservative because iCloud file downloads are sensitive to aggressive parallelism.
 - The generated systemd unit is created by `./icloudctl`; the repo does not rely on checked-in service files anymore.
-- This project currently targets a user-level systemd service, not a system-wide root service.
+- `./icloudctl` installs and manages a user-level systemd service. It does not install or manage a system-level unit.
+- `icloudctl sync` checks the user service first, then a manually configured system service named `icloud.service`. A system service can run as a non-root account with `User=`.
+- Run `icloudctl sync` as the driver's account and with the same home directory. The caller needs permission to signal the driver. Both processes use `~/.local/state/icloud-linux/sync_done`. Running the helper with `sudo` against a non-root driver can make it watch the wrong completion file and time out.
 - When `auto_sync: false`, the SIGUSR1 signal triggers a one-shot sync in the background; `icloudctl sync` handles sending that signal and waiting for completion.
