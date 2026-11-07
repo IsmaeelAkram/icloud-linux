@@ -29,19 +29,24 @@ DEFAULT_TIMEOUT = 900  # seconds (15 min — iCloud crawl of 19k+ entries takes 
 
 
 def get_driver_pid():
-    """Return PID of the running icloud.service process, or None."""
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "show", "icloud.service", "--property=MainPID", "--value"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        pid_str = result.stdout.strip()
-        pid = int(pid_str)
-        return pid if pid > 0 else None
-    except (subprocess.CalledProcessError, ValueError):
-        return None
+    """Return the PID from either a user- or system-scope service."""
+    for command in (
+        ["systemctl", "--user", "show", "icloud.service"],
+        ["systemctl", "show", "icloud.service"],
+    ):
+        try:
+            result = subprocess.run(
+                [*command, "--property=MainPID", "--value"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            pid = int(result.stdout.strip())
+            if pid > 0:
+                return pid
+        except (subprocess.CalledProcessError, ValueError):
+            continue
+    return None
 
 
 def send_sigusr1(pid):
