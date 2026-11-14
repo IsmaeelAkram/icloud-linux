@@ -641,13 +641,15 @@ class LocalMirror:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-    def write_atomic_stream(self, path, source, mtime=None, chunk_size=IO_CHUNK_SIZE):
+    def write_atomic_chunks(self, path, chunks, mtime=None):
         self.ensure_parent(path)
         local = self.local_path(path)
         fd, tmp_path = tempfile.mkstemp(dir=self.tmp_dir)
         try:
             with os.fdopen(fd, "wb") as handle:
-                shutil.copyfileobj(source, handle, length=chunk_size)
+                for chunk in chunks:
+                    if chunk:
+                        handle.write(chunk)
             os.replace(tmp_path, local)
             if mtime is not None:
                 os.utime(local, (mtime, mtime))
@@ -955,8 +957,21 @@ class ICloudSyncEngine:
                 )
                 node = self._node_from_entry(entry)
                 with closing(node.open(stream=True)) as response:
-                    self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
+                    # pyicloud reads the body itself for application/json responses
+                    # (to look for Apple error payloads), which drains response.raw.
+                    # iter_content() replays already-read content and decodes gzip.
+                    self.mirror.write_atomic_chunks(
+                        path, response.iter_content(IO_CHUNK_SIZE), entry["mtime"]
+                    )
             stats = self.mirror.stat_local(path)
+            expected_size = entry.get("size")
+            if expected_size is not None and stats.st_size != expected_size:
+                self.logger.warning(
+                    "Hydrated %s with %s bytes, remote reports %s",
+                    path,
+                    stats.st_size,
+                    expected_size,
+                )
             checksum = self.mirror.file_sha256(path)
             self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
             self._log_sync("hydrate-complete", level=logging.INFO, path=path, source="remote", size=stats.st_size)

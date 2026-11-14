@@ -1,5 +1,6 @@
 import errno
 import io
+import requests
 import errno
 import os
 import stat
@@ -45,13 +46,6 @@ class DriverStateTests(unittest.TestCase):
         self.mirror.ensure_dir("/Obsidian")
 
         self.assertTrue(self.mirror.is_dir("/Obsidian"))
-
-    def test_write_atomic_stream_copies_in_chunks(self):
-        stream = NoUnboundedReadStream(b"streamed content")
-
-        self.mirror.write_atomic_stream("/docs/a.txt", stream)
-
-        self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"streamed content")
 
     def test_rename_tree_preserves_old_synced_paths_for_local_rename(self):
         self.state.upsert_entry(
@@ -658,7 +652,8 @@ class SyncEngineStartupTests(unittest.TestCase):
             }
         )
         self.mirror.ensure_dir("/docs")
-        response = Mock()
+        response = requests.Response()
+        response.status_code = 200
         response.raw = NoUnboundedReadStream(b"chunked download")
         response.close = Mock()
         node = Mock()
@@ -669,6 +664,70 @@ class SyncEngineStartupTests(unittest.TestCase):
 
         self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"chunked download")
         response.close.assert_called_once()
+
+    def test_ensure_local_file_keeps_body_already_read_by_session(self):
+        # pyicloud reads application/json bodies itself, draining response.raw
+        self.state.upsert_entry(
+            {
+                "path": "/docs/a.json",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-2",
+                "remote_docwsid": "doc-2",
+                "remote_zone": "zone-1",
+                "size": 2,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/docs/a.json",
+            }
+        )
+        self.mirror.ensure_dir("/docs")
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "application/json"
+        response.raw = io.BytesIO(b"{}")
+        self.assertEqual(response.content, b"{}")  # drains response.raw like pyicloud does
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine.ensure_local_file("/docs/a.json")
+
+        self.assertEqual(self.mirror.read("/docs/a.json", 100, 0), b"{}")
+        self.assertEqual(self.state.get_entry("/docs/a.json")["size"], 2)
+        self.logger.warning.assert_not_called()
+
+    def test_ensure_local_file_warns_when_downloaded_size_differs(self):
+        self.state.upsert_entry(
+            {
+                "path": "/docs/b.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-3",
+                "remote_docwsid": "doc-3",
+                "remote_zone": "zone-1",
+                "size": 10,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/docs/b.txt",
+            }
+        )
+        self.mirror.ensure_dir("/docs")
+        response = requests.Response()
+        response.status_code = 200
+        response.raw = io.BytesIO(b"")
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine.ensure_local_file("/docs/b.txt")
+
+        self.logger.warning.assert_called_once()
+        self.assertIn("/docs/b.txt", self.logger.warning.call_args[0])
 
     def test_sync_file_uploads_stream_without_buffering_entire_file(self):
         self.mirror.create_file("/docs/a.txt")
